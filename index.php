@@ -10,6 +10,7 @@ const PHP_CLI_BIN = '/usr/bin/php';
 const SVTPLAY_BIN = '/opt/svtplay-dl-venv/bin/svtplay-dl';
 const FFMPEG_BIN = '/usr/bin/ffmpeg';
 const POLL_INTERVAL_SECONDS = 60;
+const PROCESS_CHECK_INTERVAL_SECONDS = 1;
 const STARTUP_CHECK_INTERVAL_SECONDS = 1;
 
 function ensureStorage(): void
@@ -219,7 +220,7 @@ function runExternalProcess(string $jobId, string $phase, string $name, array $c
         $job['error'] = null;
     });
     while ($status['running']) {
-        sleep(POLL_INTERVAL_SECONDS);
+        sleep(PROCESS_CHECK_INTERVAL_SECONDS);
         $status = proc_get_status($process);
     }
     $exitCode = (int) ($status['exitcode'] ?? -1);
