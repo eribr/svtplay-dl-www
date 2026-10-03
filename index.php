@@ -1,28 +1,351 @@
 <?php
 declare(strict_types=1);
 
-require_once __DIR__ . '/lib.php';
+const DATA_DIR = '/tmp/svtplay-dl-www';
+const REGISTRY_FILE = DATA_DIR . '/jobs.json';
+const LOCK_FILE = DATA_DIR . '/jobs.lock';
+const JOBS_DIR = DATA_DIR . '/jobs';
+const DOWNLOADS_DIR = '/var/lib/svtplay/downloads';
+const PHP_CLI_BIN = '/usr/bin/php';
+const SVTPLAY_BIN = '/opt/svtplay-dl-venv/bin/svtplay-dl';
+const FFMPEG_BIN = '/usr/bin/ffmpeg';
+const POLL_INTERVAL_MICROSECONDS = 500000;
+
+function ensureStorage(): void
+{
+    foreach ([DATA_DIR, JOBS_DIR, DOWNLOADS_DIR] as $directory) {
+        if (!is_dir($directory) && !mkdir($directory, 0750, true) && !is_dir($directory)) {
+            throw new RuntimeException('Could not create the job-data directory.');
+        }
+        chmod($directory, 0750);
+    }
+}
+
+function readRegistry(): array
+{
+    ensureStorage();
+    $lock = fopen(LOCK_FILE, 'c');
+    if ($lock === false) {
+        throw new RuntimeException('Could not open the job registry lock.');
+    }
+    chmod(LOCK_FILE, 0640);
+    try {
+        if (!flock($lock, LOCK_SH)) {
+            throw new RuntimeException('Could not lock the job registry.');
+        }
+        if (!is_file(REGISTRY_FILE)) {
+            return ['jobs' => []];
+        }
+        $contents = file_get_contents(REGISTRY_FILE);
+        $registry = is_string($contents) ? json_decode($contents, true) : null;
+        if (!is_array($registry) || !isset($registry['jobs']) || !is_array($registry['jobs'])) {
+            throw new RuntimeException('The job registry is invalid JSON.');
+        }
+        return $registry;
+    } finally {
+        flock($lock, LOCK_UN);
+        fclose($lock);
+    }
+}
+
+function updateRegistry(callable $update): array
+{
+    ensureStorage();
+    $lock = fopen(LOCK_FILE, 'c');
+    if ($lock === false) {
+        throw new RuntimeException('Could not open the job registry lock.');
+    }
+    chmod(LOCK_FILE, 0640);
+    try {
+        if (!flock($lock, LOCK_EX)) {
+            throw new RuntimeException('Could not lock the job registry.');
+        }
+        $registry = ['jobs' => []];
+        if (is_file(REGISTRY_FILE)) {
+            $contents = file_get_contents(REGISTRY_FILE);
+            $decoded = is_string($contents) ? json_decode($contents, true) : null;
+            if (!is_array($decoded) || !isset($decoded['jobs']) || !is_array($decoded['jobs'])) {
+                throw new RuntimeException('The job registry is invalid JSON.');
+            }
+            $registry = $decoded;
+        }
+        $update($registry);
+        $json = json_encode($registry, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+        $temporaryFile = tempnam(DATA_DIR, '.jobs-');
+        if ($temporaryFile === false) {
+            throw new RuntimeException('Could not create a temporary registry file.');
+        }
+        try {
+            if (file_put_contents($temporaryFile, $json . PHP_EOL, LOCK_EX) === false) {
+                throw new RuntimeException('Could not write the job registry.');
+            }
+            chmod($temporaryFile, 0640);
+            if (!rename($temporaryFile, REGISTRY_FILE)) {
+                throw new RuntimeException('Could not atomically replace the job registry.');
+            }
+        } finally {
+            if (is_file($temporaryFile)) {
+                unlink($temporaryFile);
+            }
+        }
+        return $registry;
+    } finally {
+        flock($lock, LOCK_UN);
+        fclose($lock);
+    }
+}
+
+function updateJob(string $jobId, callable $update): void
+{
+    updateRegistry(static function (array &$registry) use ($jobId, $update): void {
+        if (!isset($registry['jobs'][$jobId])) {
+            throw new RuntimeException('The requested job does not exist.');
+        }
+        $update($registry['jobs'][$jobId]);
+        $registry['jobs'][$jobId]['updated_at'] = gmdate(DATE_ATOM);
+    });
+}
+
+function normalizeSvtplayUrl(string $input): string
+{
+    $url = trim($input);
+    if ($url === '' || preg_match('/[\x00-\x20\x7f]/', $url) === 1 || preg_match('/%(?:0[0-9a-f]|1[0-9a-f]|7f)/i', $url) === 1) {
+        throw new InvalidArgumentException('Enter a valid SVT Play video URL.');
+    }
+    if (str_contains($url, '\\')) {
+        throw new InvalidArgumentException('Backslashes are not allowed in the URL.');
+    }
+    $parts = parse_url($url);
+    if (!is_array($parts)
+        || strtolower((string) ($parts['scheme'] ?? '')) !== 'https'
+        || !in_array(strtolower((string) ($parts['host'] ?? '')), ['svtplay.se', 'www.svtplay.se'], true)
+        || isset($parts['user'])
+        || isset($parts['pass'])
+        || isset($parts['port'])) {
+        throw new InvalidArgumentException('Only HTTPS URLs from svtplay.se are accepted.');
+    }
+    $path = (string) ($parts['path'] ?? '');
+    if (preg_match('~^/video/([A-Za-z0-9]+)(?:/([A-Za-z0-9-]+))?/?$~D', $path, $matches) !== 1) {
+        throw new InvalidArgumentException('The URL must point to an SVT Play video page.');
+    }
+    $canonicalPath = '/video/' . $matches[1];
+    if (isset($matches[2]) && $matches[2] !== '') {
+        $canonicalPath .= '/' . $matches[2];
+    }
+    return 'https://www.svtplay.se' . $canonicalPath;
+}
+
+function processIsExpected(int $pid, string $expectedName, array $requiredArguments = []): bool
+{
+    $commandLinePath = '/proc/' . $pid . '/cmdline';
+    if ($pid < 2 || !is_readable($commandLinePath)) {
+        return false;
+    }
+    $commandLine = file_get_contents($commandLinePath);
+    if (!is_string($commandLine) || $commandLine === '') {
+        return false;
+    }
+    $arguments = explode("\0", rtrim($commandLine, "\0"));
+    $executableMatches = isset($arguments[0]) && basename($arguments[0]) === $expectedName;
+    if ($expectedName === 'php' && isset($arguments[0]) && preg_match('/^php(?:[0-9.]*)$/', basename($arguments[0])) === 1) {
+        $executableMatches = true;
+    }
+    if ($expectedName === 'svtplay-dl' && in_array(SVTPLAY_BIN, $arguments, true)) {
+        $executableMatches = true;
+    }
+    foreach ($requiredArguments as $requiredArgument) {
+        if (!in_array($requiredArgument, $arguments, true)) {
+            return false;
+        }
+    }
+    return $executableMatches;
+}
+
+function escapeHtml(string $value): string
+{
+    return htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+}
+
+function spawnJob(string $jobId, string $logFile): int
+{
+    $launcher = 'nohup "$1" "$2" --run-job "$3" </dev/null >>"$4" 2>&1 & echo $!';
+    $process = proc_open(
+        ['/bin/sh', '-c', $launcher, 'svtplay-launcher', PHP_CLI_BIN, __FILE__, $jobId, $logFile],
+        [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+        $pipes,
+        null,
+        null,
+        ['bypass_shell' => true]
+    );
+    if (!is_resource($process)) {
+        throw new RuntimeException('Could not start the background job.');
+    }
+    $pidText = stream_get_contents($pipes[1]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $launcherExitCode = proc_close($process);
+    $pid = filter_var(trim((string) $pidText), FILTER_VALIDATE_INT);
+    if ($launcherExitCode !== 0 || $pid === false || $pid < 2) {
+        throw new RuntimeException('Could not start the background job.');
+    }
+    return $pid;
+}
+
+function runExternalProcess(string $jobId, string $phase, string $name, array $command, string $jobDirectory, string $logFile): int
+{
+    $process = proc_open(
+        $command,
+        [0 => ['file', '/dev/null', 'r'], 1 => ['file', $logFile, 'a'], 2 => ['file', $logFile, 'a']],
+        $pipes,
+        $jobDirectory,
+        null,
+        ['bypass_shell' => true]
+    );
+    if (!is_resource($process)) {
+        throw new RuntimeException('Could not start ' . $name . '.');
+    }
+    $status = proc_get_status($process);
+    $pid = (int) ($status['pid'] ?? 0);
+    if ($pid < 2) {
+        proc_close($process);
+        throw new RuntimeException('Could not determine the ' . $name . ' process ID.');
+    }
+    updateJob($jobId, static function (array &$job) use ($phase, $name, $pid): void {
+        $job['status'] = $phase;
+        $job['phase'] = $phase;
+        $job['pid'] = $pid;
+        $job['process_name'] = $name;
+        $job['error'] = null;
+    });
+    while ($status['running']) {
+        usleep(POLL_INTERVAL_MICROSECONDS);
+        $status = proc_get_status($process);
+    }
+    $exitCode = (int) ($status['exitcode'] ?? -1);
+    proc_close($process);
+    updateJob($jobId, static function (array &$job): void {
+        $job['pid'] = null;
+        $job['process_name'] = null;
+    });
+    return $exitCode;
+}
+
+function locateArtifacts(string $jobDirectory): array
+{
+    $videoExtensions = ['mp4', 'mkv', 'ts', 'webm', 'm4v', 'mov', 'avi', 'flv', 'mpg', 'mpeg'];
+    $subtitleExtensions = ['srt', 'vtt', 'ass', 'ssa'];
+    $videos = [];
+    $subtitles = [];
+    foreach (new DirectoryIterator($jobDirectory) as $file) {
+        if (!$file->isFile()) {
+            continue;
+        }
+        $extension = strtolower($file->getExtension());
+        if (in_array($extension, $videoExtensions, true)) {
+            $videos[] = $file->getPathname();
+        } elseif (in_array($extension, $subtitleExtensions, true)) {
+            $subtitles[] = $file->getPathname();
+        }
+    }
+    if (count($videos) !== 1 || count($subtitles) !== 1) {
+        throw new RuntimeException('Expected one video and one supported subtitle file. Check the job log.');
+    }
+    return [$videos[0], $subtitles[0]];
+}
+
+function runJob(string $jobId): void
+{
+    if (preg_match('/^[a-f0-9]{32}$/', $jobId) !== 1) {
+        throw new RuntimeException('Invalid job ID.');
+    }
+    $job = null;
+    for ($attempt = 0; $attempt < 40; $attempt++) {
+        $registry = readRegistry();
+        $candidate = $registry['jobs'][$jobId] ?? null;
+        if (is_array($candidate) && (int) ($candidate['worker_pid'] ?? 0) === getmypid()) {
+            $job = $candidate;
+            break;
+        }
+        usleep(50000);
+    }
+    if (!is_array($job)) {
+        throw new RuntimeException('The job was not registered for this process.');
+    }
+    ensureStorage();
+    $jobDirectory = JOBS_DIR . '/' . $jobId;
+    if (!mkdir($jobDirectory, 0750) && !is_dir($jobDirectory)) {
+        throw new RuntimeException('Could not create the job directory.');
+    }
+    $logFile = $jobDirectory . '/job.log';
+    $downloadCommand = [SVTPLAY_BIN, '--subtitle', '--require-subtitle', '--output', $jobDirectory . '/', (string) $job['url']];
+    $downloadExitCode = runExternalProcess($jobId, 'downloading', 'svtplay-dl', $downloadCommand, $jobDirectory, $logFile);
+    if ($downloadExitCode !== 0) {
+        throw new RuntimeException('svtplay-dl failed with exit code ' . $downloadExitCode . '. Check the job log.');
+    }
+    [$videoPath, $subtitlePath] = locateArtifacts($jobDirectory);
+    $subtitleExtension = strtolower(pathinfo($subtitlePath, PATHINFO_EXTENSION));
+    if (!in_array($subtitleExtension, ['srt', 'vtt', 'ass', 'ssa'], true)) {
+        throw new RuntimeException('The downloaded subtitle format is not supported.');
+    }
+    $safeSubtitlePath = $jobDirectory . '/subtitle.' . $subtitleExtension;
+    if (!copy($subtitlePath, $safeSubtitlePath)) {
+        throw new RuntimeException('Could not prepare the subtitle file for FFmpeg.');
+    }
+    $finalPath = DOWNLOADS_DIR . '/' . $jobId . '.mkv';
+    $ffmpegCommand = [
+        FFMPEG_BIN, '-nostdin', '-y', '-i', $videoPath,
+        '-vf', 'subtitles=' . $safeSubtitlePath,
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '24', '-c:a', 'copy', $finalPath,
+    ];
+    $ffmpegExitCode = runExternalProcess($jobId, 'burning', 'ffmpeg', $ffmpegCommand, $jobDirectory, $logFile);
+    if ($ffmpegExitCode !== 0 || !is_file($finalPath) || filesize($finalPath) === 0) {
+        throw new RuntimeException('FFmpeg subtitle burn-in failed. Check the job log.');
+    }
+    foreach ([$videoPath, $subtitlePath, $safeSubtitlePath] as $temporaryFile) {
+        if (is_file($temporaryFile)) {
+            unlink($temporaryFile);
+        }
+    }
+    updateJob($jobId, static function (array &$storedJob) use ($finalPath): void {
+        $storedJob['status'] = 'complete';
+        $storedJob['phase'] = 'complete';
+        $storedJob['pid'] = null;
+        $storedJob['process_name'] = null;
+        $storedJob['worker_pid'] = null;
+        $storedJob['output'] = $finalPath;
+        $storedJob['error'] = null;
+    });
+}
+
+if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === '--run-job') {
+    try {
+        runJob((string) ($argv[2] ?? ''));
+        exit(0);
+    } catch (Throwable $exception) {
+        $jobId = (string) ($argv[2] ?? '');
+        if (preg_match('/^[a-f0-9]{32}$/', $jobId) === 1) {
+            try {
+                updateJob($jobId, static function (array &$job) use ($exception): void {
+                    $job['status'] = 'failed';
+                    $job['phase'] = 'failed';
+                    $job['pid'] = null;
+                    $job['process_name'] = null;
+                    $job['worker_pid'] = null;
+                    $job['error'] = $exception->getMessage();
+                });
+            } catch (Throwable $registryException) {
+                error_log('Could not update failed job: ' . $registryException->getMessage());
+            }
+        }
+        error_log('SVT Play job failed: ' . $exception->getMessage());
+        exit(1);
+    }
+}
 
 header('X-Content-Type-Options: nosniff');
 header('X-Frame-Options: DENY');
 header('Referrer-Policy: no-referrer');
 header("Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
-
-$configuredUser = getenv('SVTPLAY_USERNAME');
-$configuredPasswordHash = getenv('SVTPLAY_PASSWORD_HASH');
-$providedUser = $_SERVER['PHP_AUTH_USER'] ?? '';
-$providedPassword = $_SERVER['PHP_AUTH_PW'] ?? '';
-
-if (!is_string($configuredUser) || $configuredUser === '' || !is_string($configuredPasswordHash) || $configuredPasswordHash === '') {
-    http_response_code(503);
-    exit('The application is not configured. Set SVTPLAY_USERNAME and SVTPLAY_PASSWORD_HASH in Apache.');
-}
-
-if (!hash_equals($configuredUser, $providedUser) || !password_verify($providedPassword, $configuredPasswordHash)) {
-    header('WWW-Authenticate: Basic realm="SVT Play Downloader", charset="UTF-8"');
-    http_response_code(401);
-    exit('Authentication required.');
-}
 
 session_start([
     'cookie_httponly' => true,
@@ -51,11 +374,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 throw new InvalidArgumentException('Enter a valid SVT Play video URL.');
             }
             $normalizedUrl = normalizeSvtplayUrl($rawUrl);
-            if (!isWorkerActive()) {
-                throw new RuntimeException('The background worker is not running. Contact the server administrator.');
-            }
-
             $jobId = bin2hex(random_bytes(16));
+            $jobDirectory = JOBS_DIR . '/' . $jobId;
+            if (!mkdir($jobDirectory, 0750, true)) {
+                throw new RuntimeException('Could not create the job directory.');
+            }
+            $logFile = $jobDirectory . '/job.log';
             updateRegistry(static function (array &$registry) use ($jobId, $normalizedUrl): void {
                 $now = gmdate(DATE_ATOM);
                 $registry['jobs'][$jobId] = [
@@ -64,6 +388,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'status' => 'queued',
                     'phase' => 'queued',
                     'pid' => null,
+                    'worker_pid' => null,
                     'process_name' => null,
                     'output' => null,
                     'error' => null,
@@ -71,6 +396,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'updated_at' => $now,
                 ];
             });
+
+            try {
+                $workerPid = spawnJob($jobId, $logFile);
+                updateJob($jobId, static function (array &$job) use ($workerPid): void {
+                    $job['status'] = 'starting';
+                    $job['phase'] = 'starting';
+                    $job['worker_pid'] = $workerPid;
+                });
+            } catch (Throwable $exception) {
+                updateJob($jobId, static function (array &$job) use ($exception): void {
+                    $job['status'] = 'failed';
+                    $job['phase'] = 'failed';
+                    $job['error'] = $exception->getMessage();
+                });
+                throw $exception;
+            }
 
             $_SESSION['flash_message'] = 'Download queued. Job ID: ' . $jobId;
             $scriptDirectory = str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'] ?? '/svtplay/index.php'));
@@ -107,21 +448,35 @@ function displayedJobStatus(array $job): string
     if ($status === 'queued') {
         return 'Queued';
     }
+    if ($status === 'starting') {
+        $jobId = (string) ($job['id'] ?? '');
+        $workerPid = filter_var($job['worker_pid'] ?? null, FILTER_VALIDATE_INT);
+        if (preg_match('/^[a-f0-9]{32}$/', $jobId) === 1
+            && $workerPid !== false
+            && processIsExpected((int) $workerPid, 'php', [__FILE__, '--run-job', $jobId])) {
+            return 'Starting';
+        }
+        return 'Process stopped unexpectedly';
+    }
     if (in_array($status, ['downloading', 'burning'], true)) {
+        $jobId = (string) ($job['id'] ?? '');
+        $workerPid = filter_var($job['worker_pid'] ?? null, FILTER_VALIDATE_INT);
+        $workerIsRunning = preg_match('/^[a-f0-9]{32}$/', $jobId) === 1
+            && $workerPid !== false
+            && processIsExpected((int) $workerPid, 'php', [__FILE__, '--run-job', $jobId]);
         $expectedName = ($job['process_name'] ?? '') === 'ffmpeg' ? 'ffmpeg' : 'svtplay-dl';
         $pid = filter_var($job['pid'] ?? null, FILTER_VALIDATE_INT);
         if ($pid === false || $pid === null) {
-            return 'Starting';
+            return $workerIsRunning ? 'Starting' : 'Process stopped unexpectedly';
         }
-        $jobId = (string) ($job['id'] ?? '');
         if (preg_match('/^[a-f0-9]{32}$/', $jobId) !== 1) {
             return 'Process stopped unexpectedly';
         }
         $jobDirectory = DATA_DIR . '/jobs/' . $jobId;
         $requiredArguments = $status === 'downloading'
-            ? ['--output', $jobDirectory . '/', (string) ($job['url'] ?? '')]
-            : [DATA_DIR . '/downloads/' . $jobId . '.mkv'];
-        if (processIsExpected((int) $pid, $expectedName, $requiredArguments)) {
+            ? [SVTPLAY_BIN, '--output', $jobDirectory . '/', (string) ($job['url'] ?? '')]
+            : [DOWNLOADS_DIR . '/' . $jobId . '.mkv'];
+        if ($workerIsRunning && processIsExpected((int) $pid, $expectedName, $requiredArguments)) {
             return $status === 'downloading' ? 'Downloading' : 'Burning subtitles';
         }
         return 'Process stopped unexpectedly';
@@ -136,7 +491,7 @@ function displayedJobStatus(array $job): string
 $csrfToken = (string) $_SESSION['csrf_token'];
 $hasActiveJobs = count(array_filter(
     $jobs,
-    static fn (array $job): bool => in_array($job['status'] ?? '', ['queued', 'downloading', 'burning'], true)
+    static fn (array $job): bool => in_array($job['status'] ?? '', ['queued', 'starting', 'downloading', 'burning'], true)
 )) > 0;
 ?>
 <!doctype html>
@@ -243,14 +598,15 @@ $hasActiveJobs = count(array_filter(
                     $statusLabel = displayedJobStatus($job);
                     $statusClass = $statusLabel === 'Process stopped unexpectedly'
                         ? 'failed'
-                        : (in_array($job['status'] ?? '', ['queued', 'downloading', 'burning'], true) ? 'running' : escapeHtml((string) ($job['status'] ?? 'unknown')));
+                        : (in_array($job['status'] ?? '', ['queued', 'starting', 'downloading', 'burning'], true) ? 'running' : escapeHtml((string) ($job['status'] ?? 'unknown')));
+                    $displayPid = $job['pid'] ?? $job['worker_pid'] ?? 'pending';
                     ?>
                     <article class="job">
                         <div class="job-url"><?= escapeHtml((string) ($job['url'] ?? '')) ?></div>
                         <span class="job-status <?= $statusClass ?>"><?= escapeHtml($statusLabel) ?></span>
                         <div class="job-meta">
                             Job <?= escapeHtml((string) ($job['id'] ?? '')) ?>
-                            · PID <?= escapeHtml((string) ($job['pid'] ?? 'pending')) ?>
+                            · PID <?= escapeHtml((string) $displayPid) ?>
                             · <?= escapeHtml((string) ($job['updated_at'] ?? '')) ?>
                         </div>
                         <?php if (($job['status'] ?? '') === 'failed' && !empty($job['error'])): ?>

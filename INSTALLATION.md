@@ -56,17 +56,15 @@ ffmpeg -hide_banner -filters 2>&1 | grep subtitles
 
 The output should include the `subtitles` filter. The PHP job must run FFmpeg as `www-data` and pass arguments separately rather than constructing a shell command string.
 
-## 5. Create job-data directories
+## 5. Create the persistent download directory
 
-Keep the job registry, temporary media, and completed downloads outside both the web project and the web document root so they cannot be fetched directly over HTTP.
+The PHP script keeps the PID registry, job records, logs, and temporary media under `/tmp/svtplay-dl-www`. It creates this temporary directory on first use. Completed videos are kept outside the web root so they can persist independently of temporary job data.
 
 ```bash
-sudo install -d -o www-data -g www-data -m 0750 /var/lib/svtplay
-sudo install -d -o www-data -g www-data -m 0750 /var/lib/svtplay/jobs
 sudo install -d -o www-data -g www-data -m 0750 /var/lib/svtplay/downloads
 ```
 
-Configure the PHP application to use these directories. Do not put the job registry or downloaded files under `/var/www/html` or in the cloned repository.
+The job registry is `/tmp/svtplay-dl-www/jobs.json`; its lock file is `/tmp/svtplay-dl-www/jobs.lock`. Temporary files and per-job logs are under `/tmp/svtplay-dl-www/jobs`. Temporary registry and job data are removed when Raspberry Pi OS clears `/tmp`, commonly on reboot. Completed videos are written to `/var/lib/svtplay/downloads`.
 
 ## 6. Publish the project through a symlink
 
@@ -85,10 +83,10 @@ Apache must have `FollowSymLinks` enabled for `/var/www/html`. Check the active 
 readlink -f /var/www/html/svtplay
 ```
 
-The symlink exposes repository files under the web root. Deny HTTP access to `.git`, deployment files, internal PHP files, Markdown files, and `LICENSE`. Create `/etc/apache2/conf-available/svtplay.conf` with this content:
+The symlink exposes repository files under the web root. Deny HTTP access to `.git`, Markdown files, and `LICENSE`. Create `/etc/apache2/conf-available/svtplay.conf` with this content:
 
 ```apache
-<LocationMatch "^/svtplay/(?:\.git|deploy)(?:/|$)|^/svtplay/(?:lib|worker)\.php$|^/svtplay/.*\.md$|^/svtplay/LICENSE$">
+<LocationMatch "^/svtplay/(?:\.git(?:/|$)|.*\.md$|LICENSE$)">
     Require all denied
 </LocationMatch>
 ```
@@ -118,51 +116,63 @@ sudo systemctl reload apache2
 
 Once `index.php` has been implemented, open `http://<webserver>/svtplay`. The URL `http://<webserver>/svtplay/` should also work.
 
-## 8. Configure application authentication
+## 8. Restrict network access
 
-The application requires HTTP Basic Authentication. Generate a password hash; enter the password when prompted:
+The application has no password prompt or application-level authentication. Anyone who can reach the page can start downloads and consume the Raspberry Pi's bandwidth, CPU, and storage. Keep it on a trusted private network and restrict access to trusted devices with your router or firewall. Do not expose it directly to the public internet.
 
-```bash
-php -r 'echo password_hash(trim(fgets(STDIN)), PASSWORD_DEFAULT), PHP_EOL;'
-```
+## 9. Verify the application
 
-Create `/etc/apache2/conf-available/svtplay-auth.conf` and replace both example values with your chosen username and the generated hash:
-
-```apache
-SetEnv SVTPLAY_USERNAME "replace-with-a-username"
-SetEnv SVTPLAY_PASSWORD_HASH "replace-with-the-generated-password-hash"
-```
-
-Enable the configuration and reload Apache:
-
-```bash
-sudo a2enconf svtplay-auth
-sudo apachectl configtest
-sudo systemctl reload apache2
-```
-
-Basic Authentication does not encrypt credentials over plain HTTP. Configure HTTPS before exposing this application beyond a trusted, isolated network.
-
-## 9. Install and start the background worker
-
-The worker runs continuously as `www-data`, consumes queued jobs, and updates the JSON registry as it downloads and processes each video. Install the repository's systemd unit and enable it:
-
-```bash
-sudo cp /var/www/html/svtplay/deploy/svtplay-worker.service /etc/systemd/system/svtplay-worker.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now svtplay-worker.service
-sudo systemctl status svtplay-worker.service
-```
-
-The service expects the symlink `/var/www/html/svtplay`, the directories under `/var/lib/svtplay`, and the executable paths documented above. It writes per-job logs and failed-job temporary files under `/var/lib/svtplay/jobs`; after successful processing it removes intermediate media/subtitle files and retains the final MKV under `/var/lib/svtplay/downloads`.
-
-## 10. Verify the service
+No systemd service or separately installed worker is required. When a valid URL is submitted, `index.php` starts another CLI instance of itself in the background. That process runs `svtplay-dl`, burns the subtitle into the video with FFmpeg, and updates the PID registry.
 
 ```bash
 sudo systemctl status apache2
-sudo systemctl status svtplay-worker.service
 sudo -u www-data /opt/svtplay-dl-venv/bin/svtplay-dl --version
 ffmpeg -hide_banner -filters 2>&1 | grep subtitles
 ```
 
-If Apache returns `403 Forbidden`, check `FollowSymLinks`, ACL permissions on every directory in the path, and the Apache error log. If the worker cannot start child processes, check that `proc_open` is enabled for PHP CLI and that the job and download directories are owned by `www-data`. If submissions say that the worker is not running, inspect `journalctl -u svtplay-worker.service`.
+After submitting a job, inspect registered PIDs with `ps` if needed:
+
+```bash
+ps -eo pid,ppid,user,args | grep -E '[i]ndex.php --run-job|[s]vtplay-dl|[f]fmpeg'
+```
+
+The page checks the recorded PID against `/proc/<pid>/cmdline` to ensure the process is the expected job, rather than trusting that a PID merely exists. If Apache returns `403 Forbidden`, check `FollowSymLinks`, ACL permissions on every directory in the path, and the Apache error log. If background jobs do not start, check that PHP CLI and `proc_open` are available to `www-data`, and that `/var/lib/svtplay/downloads` is writable by `www-data`.
+
+## 10. Uninstall
+
+Disable the Apache access rule, remove the web-root symlink, and reload Apache:
+
+```bash
+sudo a2disconf svtplay
+sudo apachectl configtest
+sudo systemctl reload apache2
+sudo rm /var/www/html/svtplay
+```
+
+If an older installation created `/etc/apache2/conf-available/svtplay-auth.conf`, remove that obsolete configuration too:
+
+```bash
+sudo a2disconf svtplay-auth
+sudo rm -f /etc/apache2/conf-available/svtplay-auth.conf
+sudo apachectl configtest
+sudo systemctl reload apache2
+```
+
+The application code remains in `$HOME/svtplay-dl-www`. Remove it only after preserving any local changes you need:
+
+```bash
+rm -rf "$HOME/svtplay-dl-www"
+```
+
+The PID registry and temporary job files are under `/tmp/svtplay-dl-www` and may be removed after confirming that no jobs are running. Completed downloads are kept separately. To permanently delete those downloads as well, review the directory contents first; the next command is irreversible:
+
+```bash
+sudo find /var/lib/svtplay/downloads -maxdepth 1 -type f -print
+sudo rm -rf /tmp/svtplay-dl-www /var/lib/svtplay/downloads
+```
+
+The Python virtual environment can be removed if it is not used by another application:
+
+```bash
+sudo rm -rf /opt/svtplay-dl-venv
+```
