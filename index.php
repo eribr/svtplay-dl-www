@@ -9,7 +9,8 @@ const DOWNLOADS_DIR = '/var/lib/svtplay/downloads';
 const PHP_CLI_BIN = '/usr/bin/php';
 const SVTPLAY_BIN = '/opt/svtplay-dl-venv/bin/svtplay-dl';
 const FFMPEG_BIN = '/usr/bin/ffmpeg';
-const POLL_INTERVAL_MICROSECONDS = 500000;
+const POLL_INTERVAL_SECONDS = 60;
+const STARTUP_CHECK_INTERVAL_SECONDS = 1;
 
 function ensureStorage(): void
 {
@@ -218,7 +219,7 @@ function runExternalProcess(string $jobId, string $phase, string $name, array $c
         $job['error'] = null;
     });
     while ($status['running']) {
-        usleep(POLL_INTERVAL_MICROSECONDS);
+        sleep(POLL_INTERVAL_SECONDS);
         $status = proc_get_status($process);
     }
     $exitCode = (int) ($status['exitcode'] ?? -1);
@@ -236,10 +237,12 @@ function locateArtifacts(string $jobDirectory): array
     $subtitleExtensions = ['srt', 'vtt', 'ass', 'ssa'];
     $videos = [];
     $subtitles = [];
+    $files = [];
     foreach (new DirectoryIterator($jobDirectory) as $file) {
         if (!$file->isFile()) {
             continue;
         }
+        $files[] = $file->getFilename();
         $extension = strtolower($file->getExtension());
         if (in_array($extension, $videoExtensions, true)) {
             $videos[] = $file->getPathname();
@@ -248,7 +251,14 @@ function locateArtifacts(string $jobDirectory): array
         }
     }
     if (count($videos) !== 1 || count($subtitles) !== 1) {
-        throw new RuntimeException('Expected one video and one supported subtitle file. Check the job log.');
+        sort($files, SORT_NATURAL | SORT_FLAG_CASE);
+        $fileList = $files === [] ? '(no files)' : implode(', ', $files);
+        throw new RuntimeException(
+            'Artifact detection failed in this job directory: found '
+            . count($videos) . ' supported video file(s) and '
+            . count($subtitles) . ' supported subtitle file(s). Files: '
+            . $fileList . '. Check the job log.'
+        );
     }
     return [$videos[0], $subtitles[0]];
 }
@@ -259,14 +269,14 @@ function runJob(string $jobId): void
         throw new RuntimeException('Invalid job ID.');
     }
     $job = null;
-    for ($attempt = 0; $attempt < 40; $attempt++) {
+    for ($attempt = 0; $attempt < 5; $attempt++) {
         $registry = readRegistry();
         $candidate = $registry['jobs'][$jobId] ?? null;
         if (is_array($candidate) && (int) ($candidate['worker_pid'] ?? 0) === getmypid()) {
             $job = $candidate;
             break;
         }
-        usleep(50000);
+        sleep(STARTUP_CHECK_INTERVAL_SECONDS);
     }
     if (!is_array($job)) {
         throw new RuntimeException('The job was not registered for this process.');
@@ -503,7 +513,7 @@ $hasActiveJobs = count(array_filter(
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <?php if ($hasActiveJobs): ?>
-        <meta http-equiv="refresh" content="5">
+        <meta http-equiv="refresh" content="<?= POLL_INTERVAL_SECONDS ?>">
     <?php endif; ?>
     <title>SVT Play Downloader</title>
     <style>
