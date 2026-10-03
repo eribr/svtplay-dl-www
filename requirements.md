@@ -35,6 +35,7 @@ A PHP web page shall let a user start a download from SVT Play using `svtplay-dl
 - Store the PID registry at `/tmp/svtplay-dl-www/jobs.json`, its lock at `/tmp/svtplay-dl-www/jobs.lock`, and per-job work directories/logs under `/tmp/svtplay-dl-www/jobs`. Store completed MKV files persistently under `/var/lib/svtplay/downloads`.
 - Store the `svtplay-dl` PID in the job record. During post-processing, also store the FFmpeg PID or another verifiable process identity for the active phase.
 - Show each job's URL, PID, and current phase on the home page, for example `downloading`, `burning subtitles`, `complete`, or `failed`.
+- For failed jobs and jobs whose process stopped unexpectedly, display an expandable, HTML-escaped tail of the per-job log, bounded to 12 KB.
 - Check active PIDs when rendering the page by comparing them with Raspberry Pi OS process information at `/proc/<pid>/cmdline`. Verify the expected command and job-specific arguments so PID reuse cannot make an unrelated process appear active.
 - Report process-start failures to the user and do not register a failed start as an active job.
 - Concurrent POST requests must not overwrite or corrupt the job history.

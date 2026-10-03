@@ -168,6 +168,36 @@ function escapeHtml(string $value): string
     return htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 }
 
+function readJobLogTail(string $jobId): string
+{
+    if (preg_match('/^[a-f0-9]{32}$/', $jobId) !== 1) {
+        return '';
+    }
+    $logFile = JOBS_DIR . '/' . $jobId . '/job.log';
+    $handle = @fopen($logFile, 'rb');
+    if ($handle === false) {
+        return '';
+    }
+
+    $maximumBytes = 12288;
+    $fileSize = fstat($handle)['size'] ?? 0;
+    if ($fileSize > $maximumBytes) {
+        fseek($handle, -$maximumBytes, SEEK_END);
+    }
+    $contents = stream_get_contents($handle);
+    fclose($handle);
+    if (!is_string($contents)) {
+        return '';
+    }
+    if ($fileSize > $maximumBytes) {
+        $firstNewline = strpos($contents, "\n");
+        if ($firstNewline !== false) {
+            $contents = substr($contents, $firstNewline + 1);
+        }
+    }
+    return trim($contents);
+}
+
 function spawnJob(string $jobId, string $logFile): int
 {
     $launcher = 'nohup "$1" "$2" --run-job "$3" </dev/null >>"$4" 2>&1 & echo $!';
@@ -614,6 +644,8 @@ $hasActiveJobs = count(array_filter(
                         ? 'failed'
                         : (in_array($job['status'] ?? '', ['queued', 'starting', 'downloading', 'burning'], true) ? 'running' : escapeHtml((string) ($job['status'] ?? 'unknown')));
                     $displayPid = $job['pid'] ?? $job['worker_pid'] ?? 'pending';
+                    $showLog = ($job['status'] ?? '') === 'failed' || $statusLabel === 'Process stopped unexpectedly';
+                    $jobLog = $showLog ? readJobLogTail((string) ($job['id'] ?? '')) : '';
                     ?>
                     <article class="job">
                         <div class="job-url"><?= escapeHtml((string) ($job['url'] ?? '')) ?></div>
@@ -627,6 +659,12 @@ $hasActiveJobs = count(array_filter(
                             <div class="job-meta"><?= escapeHtml((string) $job['error']) ?></div>
                         <?php elseif (($job['status'] ?? '') === 'complete' && !empty($job['output'])): ?>
                             <div class="job-meta">Output: <?= escapeHtml((string) $job['output']) ?></div>
+                        <?php endif; ?>
+                        <?php if ($showLog): ?>
+                            <details class="job-log-details">
+                                <summary>Job log, last 12 KB</summary>
+                                <pre class="job-log"><?= $jobLog !== '' ? escapeHtml($jobLog) : 'No job log is available.' ?></pre>
+                            </details>
                         <?php endif; ?>
                     </article>
                 <?php endforeach; ?>
