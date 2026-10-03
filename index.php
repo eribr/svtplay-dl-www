@@ -356,7 +356,7 @@ function locateArtifacts(string $jobDirectory, bool $allowMissingSubtitle = fals
             $subtitles[] = $file->getPathname();
         }
     }
-    if ($allowMissingSubtitle && $videos === [] && $subtitles === [] && $files === []) {
+    if ($allowMissingSubtitle && $videos === [] && $subtitles === []) {
         return [null, null];
     }
     if ($allowMissingSubtitle && count($videos) === 1 && $subtitles === []) {
@@ -411,7 +411,7 @@ function runJob(string $jobId): void
     }
     [$videoPath, $subtitlePath] = locateArtifacts($jobDirectory, true);
     if ($videoPath === null && $subtitlePath === null) {
-        appendJobLog($logFile, 'No media artifacts were produced with --require-subtitle; retrying without subtitle options.');
+        appendJobLog($logFile, 'No video or subtitle artifacts were produced with --require-subtitle; retrying without subtitle options.');
         $fallbackCommand = [SVTPLAY_BIN, '--output', $jobDirectory . '/', (string) $job['url']];
         $fallbackExitCode = runExternalProcess($jobId, 'downloading', 'svtplay-dl', $fallbackCommand, $jobDirectory, $logFile);
         if ($fallbackExitCode !== 0) {
