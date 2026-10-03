@@ -198,6 +198,73 @@ function readJobLogTail(string $jobId): string
     return trim($contents);
 }
 
+function removeJobPath(string $path): void
+{
+    if (is_link($path) || is_file($path)) {
+        if (!unlink($path)) {
+            throw new RuntimeException('Could not remove a job file.');
+        }
+        return;
+    }
+    if (!is_dir($path)) {
+        return;
+    }
+    $entries = scandir($path);
+    if ($entries === false) {
+        throw new RuntimeException('Could not list a job directory for removal.');
+    }
+    foreach ($entries as $entry) {
+        if ($entry === '.' || $entry === '..') {
+            continue;
+        }
+        removeJobPath($path . DIRECTORY_SEPARATOR . $entry);
+    }
+    if (!rmdir($path)) {
+        throw new RuntimeException('Could not remove a job directory.');
+    }
+}
+
+function deleteSelectedJobs(array $submittedIds): array
+{
+    $selectedIds = [];
+    foreach ($submittedIds as $submittedId) {
+        if (!is_string($submittedId) || preg_match('/^[a-f0-9]{32}$/', $submittedId) !== 1) {
+            throw new InvalidArgumentException('The selected job list is invalid.');
+        }
+        $selectedIds[$submittedId] = true;
+    }
+    if ($selectedIds === []) {
+        throw new InvalidArgumentException('Select at least one completed or failed job.');
+    }
+
+    $deletedIds = [];
+    $skippedCount = 0;
+    updateRegistry(static function (array &$registry) use ($selectedIds, &$deletedIds, &$skippedCount): void {
+        foreach (array_keys($selectedIds) as $jobId) {
+            if (!isset($registry['jobs'][$jobId])) {
+                continue;
+            }
+            $status = $registry['jobs'][$jobId]['status'] ?? '';
+            if (!in_array($status, ['complete', 'failed'], true)) {
+                $skippedCount++;
+                continue;
+            }
+            unset($registry['jobs'][$jobId]);
+            $deletedIds[] = $jobId;
+        }
+    });
+
+    $cleanupErrors = [];
+    foreach ($deletedIds as $jobId) {
+        try {
+            removeJobPath(JOBS_DIR . '/' . $jobId);
+        } catch (Throwable $exception) {
+            $cleanupErrors[] = $jobId . ': ' . $exception->getMessage();
+        }
+    }
+    return [count($deletedIds), $skippedCount, $cleanupErrors];
+}
+
 function appendJobLog(string $logFile, string $message): void
 {
     $line = '[' . gmdate(DATE_ATOM) . '] ' . $message . PHP_EOL;
@@ -270,7 +337,7 @@ function runExternalProcess(string $jobId, string $phase, string $name, array $c
     return $exitCode;
 }
 
-function locateArtifacts(string $jobDirectory): array
+function locateArtifacts(string $jobDirectory, bool $allowMissingSubtitle = false): array
 {
     $videoExtensions = ['mp4', 'mkv', 'ts', 'webm', 'm4v', 'mov', 'avi', 'flv', 'mpg', 'mpeg'];
     $subtitleExtensions = ['srt', 'vtt', 'ass', 'ssa'];
@@ -288,6 +355,12 @@ function locateArtifacts(string $jobDirectory): array
         } elseif (in_array($extension, $subtitleExtensions, true)) {
             $subtitles[] = $file->getPathname();
         }
+    }
+    if ($allowMissingSubtitle && $videos === [] && $subtitles === [] && $files === []) {
+        return [null, null];
+    }
+    if ($allowMissingSubtitle && count($videos) === 1 && $subtitles === []) {
+        return [$videos[0], null];
     }
     if ($videos === [] && $subtitles === [] && $files === []) {
         throw new RuntimeException(
@@ -336,37 +409,64 @@ function runJob(string $jobId): void
     if ($downloadExitCode !== 0) {
         throw new RuntimeException('svtplay-dl failed with exit code ' . $downloadExitCode . '. Check the job log.');
     }
-    [$videoPath, $subtitlePath] = locateArtifacts($jobDirectory);
-    $subtitleExtension = strtolower(pathinfo($subtitlePath, PATHINFO_EXTENSION));
-    if (!in_array($subtitleExtension, ['srt', 'vtt', 'ass', 'ssa'], true)) {
-        throw new RuntimeException('The downloaded subtitle format is not supported.');
+    [$videoPath, $subtitlePath] = locateArtifacts($jobDirectory, true);
+    if ($videoPath === null && $subtitlePath === null) {
+        appendJobLog($logFile, 'No media artifacts were produced with --require-subtitle; retrying without subtitle options.');
+        $fallbackCommand = [SVTPLAY_BIN, '--output', $jobDirectory . '/', (string) $job['url']];
+        $fallbackExitCode = runExternalProcess($jobId, 'downloading', 'svtplay-dl', $fallbackCommand, $jobDirectory, $logFile);
+        if ($fallbackExitCode !== 0) {
+            throw new RuntimeException('svtplay-dl failed without subtitle options, exit code ' . $fallbackExitCode . '. Check the job log.');
+        }
+        [$videoPath, $subtitlePath] = locateArtifacts($jobDirectory, true);
     }
-    $safeSubtitlePath = $jobDirectory . '/subtitle.' . $subtitleExtension;
-    if (!copy($subtitlePath, $safeSubtitlePath)) {
-        throw new RuntimeException('Could not prepare the subtitle file for FFmpeg.');
+    if ($videoPath === null) {
+        throw new RuntimeException('svtplay-dl produced no video file, even without subtitle options. Check the job log.');
+    }
+
+    $safeSubtitlePath = null;
+    if ($subtitlePath !== null) {
+        $subtitleExtension = strtolower(pathinfo($subtitlePath, PATHINFO_EXTENSION));
+        if (!in_array($subtitleExtension, ['srt', 'vtt', 'ass', 'ssa'], true)) {
+            throw new RuntimeException('The downloaded subtitle format is not supported.');
+        }
+        $safeSubtitlePath = $jobDirectory . '/subtitle.' . $subtitleExtension;
+        if (!copy($subtitlePath, $safeSubtitlePath)) {
+            throw new RuntimeException('Could not prepare the subtitle file for FFmpeg.');
+        }
     }
     $finalPath = DOWNLOADS_DIR . '/' . $jobId . '.mkv';
-    $ffmpegCommand = [
-        FFMPEG_BIN, '-nostdin', '-y', '-i', $videoPath,
-        '-vf', 'subtitles=' . $safeSubtitlePath,
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '24', '-c:a', 'copy', $finalPath,
-    ];
-    $ffmpegExitCode = runExternalProcess($jobId, 'burning', 'ffmpeg', $ffmpegCommand, $jobDirectory, $logFile);
+    $ffmpegCommand = [FFMPEG_BIN, '-nostdin', '-y', '-i', $videoPath];
+    if ($safeSubtitlePath !== null) {
+        $ffmpegCommand = array_merge($ffmpegCommand, [
+            '-vf', 'subtitles=' . $safeSubtitlePath,
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '24', '-c:a', 'copy',
+        ]);
+    } else {
+        $ffmpegCommand = array_merge($ffmpegCommand, ['-c', 'copy']);
+    }
+    $ffmpegCommand[] = $finalPath;
+    $ffmpegPhase = $safeSubtitlePath !== null ? 'burning' : 'finalizing';
+    $ffmpegExitCode = runExternalProcess($jobId, $ffmpegPhase, 'ffmpeg', $ffmpegCommand, $jobDirectory, $logFile);
     if ($ffmpegExitCode !== 0 || !is_file($finalPath) || filesize($finalPath) === 0) {
         throw new RuntimeException('FFmpeg subtitle burn-in failed. Check the job log.');
     }
     foreach ([$videoPath, $subtitlePath, $safeSubtitlePath] as $temporaryFile) {
+        if (!is_string($temporaryFile)) {
+            continue;
+        }
         if (is_file($temporaryFile)) {
             unlink($temporaryFile);
         }
     }
-    updateJob($jobId, static function (array &$storedJob) use ($finalPath): void {
+    $completionNote = $safeSubtitlePath === null ? 'No subtitles were available; video saved without burned-in subtitles.' : null;
+    updateJob($jobId, static function (array &$storedJob) use ($finalPath, $completionNote): void {
         $storedJob['status'] = 'complete';
         $storedJob['phase'] = 'complete';
         $storedJob['pid'] = null;
         $storedJob['process_name'] = null;
         $storedJob['worker_pid'] = null;
         $storedJob['output'] = $finalPath;
+        $storedJob['note'] = $completionNote;
         $storedJob['error'] = null;
     });
 }
@@ -422,6 +522,35 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (!is_string($submittedToken) || !hash_equals($_SESSION['csrf_token'], $submittedToken)) {
         http_response_code(400);
         $errorMessage = 'The form expired. Reload the page and try again.';
+    } elseif (($_POST['action'] ?? '') === 'delete_selected') {
+        try {
+            $submittedIds = $_POST['job_ids'] ?? [];
+            if (!is_array($submittedIds)) {
+                throw new InvalidArgumentException('The selected job list is invalid.');
+            }
+            [$deletedCount, $skippedCount, $cleanupErrors] = deleteSelectedJobs($submittedIds);
+            $flashMessage = 'Deleted ' . $deletedCount . ' job record(s), logs, and temporary files. Completed videos were kept.';
+            if ($skippedCount > 0) {
+                $flashMessage .= ' Skipped ' . $skippedCount . ' active job(s).';
+            }
+            if ($cleanupErrors !== []) {
+                error_log('SVT Play job cleanup failed: ' . implode('; ', $cleanupErrors));
+                $flashMessage .= ' Some files could not be removed; check the server log.';
+            }
+            $_SESSION['flash_message'] = $flashMessage;
+            $scriptDirectory = str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'] ?? '/svtplay/index.php'));
+            $redirectPath = rtrim($scriptDirectory, '/');
+            header('Location: ' . ($redirectPath === '' ? '/' : $redirectPath . '/'), true, 303);
+            exit;
+        } catch (InvalidArgumentException $exception) {
+            $errorMessage = $exception->getMessage();
+        } catch (Throwable $exception) {
+            error_log('SVT Play job deletion failed: ' . $exception->getMessage());
+            $errorMessage = 'The selected jobs could not be deleted. Check the server log.';
+        }
+    } elseif (isset($_POST['action']) && $_POST['action'] !== 'download') {
+        http_response_code(400);
+        $errorMessage = 'Unknown form action.';
     } else {
         try {
             $rawUrl = $_POST['url'] ?? '';
@@ -446,6 +575,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'worker_pid' => null,
                     'process_name' => null,
                     'output' => null,
+                    'note' => null,
                     'error' => null,
                     'created_at' => $now,
                     'updated_at' => $now,
@@ -513,7 +643,7 @@ function displayedJobStatus(array $job): string
         }
         return 'Process stopped unexpectedly';
     }
-    if (in_array($status, ['downloading', 'burning'], true)) {
+    if (in_array($status, ['downloading', 'burning', 'finalizing'], true)) {
         $jobId = (string) ($job['id'] ?? '');
         $workerPid = filter_var($job['worker_pid'] ?? null, FILTER_VALIDATE_INT);
         $workerIsRunning = preg_match('/^[a-f0-9]{32}$/', $jobId) === 1
@@ -532,7 +662,10 @@ function displayedJobStatus(array $job): string
             ? [SVTPLAY_BIN, '--output', $jobDirectory . '/', (string) ($job['url'] ?? '')]
             : [DOWNLOADS_DIR . '/' . $jobId . '.mkv'];
         if ($workerIsRunning && processIsExpected((int) $pid, $expectedName, $requiredArguments)) {
-            return $status === 'downloading' ? 'Downloading' : 'Burning subtitles';
+            if ($status === 'downloading') {
+                return 'Downloading';
+            }
+            return $status === 'burning' ? 'Burning subtitles' : 'Finalizing video';
         }
         return 'Process stopped unexpectedly';
     }
@@ -549,7 +682,7 @@ function displayedJobStatus(array $job): string
 $csrfToken = (string) $_SESSION['csrf_token'];
 $hasActiveJobs = count(array_filter(
     $jobs,
-    static fn (array $job): bool => in_array($job['status'] ?? '', ['queued', 'starting', 'downloading', 'burning'], true)
+    static fn (array $job): bool => in_array($job['status'] ?? '', ['queued', 'starting', 'downloading', 'burning', 'finalizing'], true)
 )) > 0;
 ?>
 <!doctype html>
@@ -597,9 +730,13 @@ $hasActiveJobs = count(array_filter(
         .notice { margin: 16px 0 0; padding: 11px 13px; border-left: 3px solid var(--green); background: #edf5ef; }
         .notice.error { border-color: var(--red); background: #fff0ef; }
         h2 { margin: 32px 0 12px; font-size: 20px; }
+        .job-actions { display: flex; justify-content: flex-end; margin: 0 0 10px; }
+        .job-delete-button { background: var(--red); }
+        .job-delete-button:hover { background: #812626; }
         .job-list { overflow: hidden; }
-        .job { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 18px; padding: 17px 20px; border-bottom: 1px solid var(--line); }
+        .job { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 18px; padding: 17px 20px 17px 54px; border-bottom: 1px solid var(--line); }
         .job:last-child { border-bottom: 0; }
+        .job-select { position: absolute; top: 21px; left: 20px; width: 18px; height: 18px; accent-color: var(--red); }
         .job-url { overflow-wrap: anywhere; font-weight: 650; }
         .job-meta { color: var(--muted); font-size: 13px; }
         .job-status { align-self: start; padding: 3px 9px; border: 1px solid var(--line); border-radius: 20px; font-size: 12px; font-weight: 700; white-space: nowrap; }
@@ -613,7 +750,8 @@ $hasActiveJobs = count(array_filter(
             .form-panel { padding: 16px; }
             .form-row { flex-direction: column; }
             button { width: 100%; }
-            .job { grid-template-columns: minmax(0, 1fr); }
+            .job { grid-template-columns: minmax(0, 1fr); padding-left: 42px; }
+            .job-select { left: 12px; }
             .job-status { grid-row: 1; justify-self: start; }
         }
     </style>
@@ -647,21 +785,33 @@ $hasActiveJobs = count(array_filter(
 
     <section aria-labelledby="jobs-heading">
         <h2 id="jobs-heading">Download jobs</h2>
-        <div class="panel job-list">
+        <form method="post" action="">
+            <input type="hidden" name="csrf_token" value="<?= escapeHtml($csrfToken) ?>">
+            <input type="hidden" name="action" value="delete_selected">
+            <?php if ($jobs !== []): ?>
+                <div class="job-actions">
+                    <button class="job-delete-button" type="submit">Delete selected job records and logs</button>
+                </div>
+            <?php endif; ?>
+            <div class="panel job-list">
             <?php if ($jobs === []): ?>
                 <div class="empty">No downloads have been started.</div>
             <?php else: ?>
                 <?php foreach ($jobs as $job): ?>
                     <?php
+                    $jobId = (string) ($job['id'] ?? '');
+                    $isDeletable = in_array($job['status'] ?? '', ['complete', 'failed'], true)
+                        && preg_match('/^[a-f0-9]{32}$/', $jobId) === 1;
                     $statusLabel = displayedJobStatus($job);
                     $statusClass = $statusLabel === 'Process stopped unexpectedly'
                         ? 'failed'
-                        : (in_array($job['status'] ?? '', ['queued', 'starting', 'downloading', 'burning'], true) ? 'running' : escapeHtml((string) ($job['status'] ?? 'unknown')));
+                        : (in_array($job['status'] ?? '', ['queued', 'starting', 'downloading', 'burning', 'finalizing'], true) ? 'running' : escapeHtml((string) ($job['status'] ?? 'unknown')));
                     $displayPid = $job['pid'] ?? $job['worker_pid'] ?? 'pending';
                     $showLog = ($job['status'] ?? '') === 'failed' || $statusLabel === 'Process stopped unexpectedly';
                     $jobLog = $showLog ? readJobLogTail((string) ($job['id'] ?? '')) : '';
                     ?>
                     <article class="job">
+                        <input class="job-select" type="checkbox" name="job_ids[]" value="<?= escapeHtml($jobId) ?>" aria-label="Select job <?= escapeHtml($jobId) ?>" <?= $isDeletable ? '' : 'disabled' ?>>
                         <div class="job-url"><?= escapeHtml((string) ($job['url'] ?? '')) ?></div>
                         <span class="job-status <?= $statusClass ?>"><?= escapeHtml($statusLabel) ?></span>
                         <div class="job-meta">
@@ -673,6 +823,9 @@ $hasActiveJobs = count(array_filter(
                             <div class="job-meta"><?= escapeHtml((string) $job['error']) ?></div>
                         <?php elseif (($job['status'] ?? '') === 'complete' && !empty($job['output'])): ?>
                             <div class="job-meta">Output: <?= escapeHtml((string) $job['output']) ?></div>
+                            <?php if (!empty($job['note'])): ?>
+                                <div class="job-meta"><?= escapeHtml((string) $job['note']) ?></div>
+                            <?php endif; ?>
                         <?php endif; ?>
                         <?php if ($showLog): ?>
                             <details class="job-log-details">
@@ -683,7 +836,8 @@ $hasActiveJobs = count(array_filter(
                     </article>
                 <?php endforeach; ?>
             <?php endif; ?>
-        </div>
+            </div>
+        </form>
     </section>
 </main>
 </body>
