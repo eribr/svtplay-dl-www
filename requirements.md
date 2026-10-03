@@ -15,7 +15,7 @@ A PHP web page shall let a user start a download from SVT Play using `svtplay-dl
 
 ## Functional requirements
 
-- The PHP page shall be named `index.php` and be located in the project root. Apache shall configure `DirectoryIndex index.php` so `http://<webserver>/svtplay` loads the page without the filename in the URL.
+- The PHP page shall be named `index.php` and be located in the project root. Installation shall create a real `/var/www/html/svtplay` directory and symlink only the project's `index.php` to `/var/www/html/svtplay/index.php`; it shall not symlink the whole project directory. Apache shall use `DirectoryIndex index.php` so `http://<webserver>/svtplay` loads the page without the filename in the URL.
 - Only POST may start a download job. GET shall only display the page and job status.
 - Require a per-session CSRF token for POST requests and reject missing or invalid tokens.
 - The URL field is required, and the form shall clearly report a missing or invalid URL.
@@ -60,7 +60,7 @@ A PHP web page shall let a user start a download from SVT Play using `svtplay-dl
 ## Runtime requirements
 
 - The documented target platform is a Raspberry Pi running Raspberry Pi OS, with Apache and PHP.
-- Use PHP 8.0 or later with PHP CLI and `proc_open` enabled. No systemd service is required.
+- Use PHP 7.4 or later with PHP CLI and `proc_open` enabled. A currently security-supported PHP 8.x release is recommended. No systemd service is required.
 - PHP must be able to start external processes and read/write the job registry.
 - `svtplay-dl` must be installed and available to the system user running PHP.
 - `ffmpeg` must be installed and available to the same system user, with support for the `subtitles` filter (normally provided through libass).
@@ -70,7 +70,7 @@ A PHP web page shall let a user start a download from SVT Play using `svtplay-dl
 
 ## Acceptance criteria
 
-- Once deployed as `/var/www/html/svtplay`, `http://<webserver>/svtplay` automatically displays `index.php`.
+- Once deployed with a real `/var/www/html/svtplay` directory containing only the `index.php` symlink, `http://<webserver>/svtplay` automatically displays the application.
 - A valid SVT Play video URL can be submitted by POST and starts a separate `svtplay-dl` job.
 - Valid submissions start a detached CLI invocation of the same `index.php` file without keeping the HTTP request open until download completion.
 - Requests with an invalid or missing CSRF token are rejected.

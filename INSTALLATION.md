@@ -17,7 +17,7 @@ php -v
 sudo apachectl -M | grep php
 ```
 
-The application requires PHP 8.0 or later.
+The application requires PHP 7.4 or later. PHP 8.x is recommended because PHP 7.4 is no longer security-supported. Verify the version used by both CLI and Apache; they must both be at least 7.4.
 
 ## 2. Clone the project
 
@@ -66,37 +66,23 @@ sudo install -d -o www-data -g www-data -m 0750 /var/lib/svtplay/downloads
 
 The job registry is `/tmp/svtplay-dl-www/jobs.json`; its lock file is `/tmp/svtplay-dl-www/jobs.lock`. Temporary files and per-job logs are under `/tmp/svtplay-dl-www/jobs`. Temporary registry and job data are removed when Raspberry Pi OS clears `/tmp`, commonly on reboot. Completed videos are written to `/var/lib/svtplay/downloads`.
 
-## 6. Publish the project through a symlink
+## 6. Publish only `index.php`
 
-Apache needs permission to traverse the home directory and read the project files. These ACL commands grant `www-data` traversal through the home directory and read access to the project without making the home directory listable to everyone.
+Create a real directory for the application under Apache's document root, then link only `index.php` into it. Apache needs traversal permission for the home directory and project directory, plus read permission for the PHP file.
 
 ```bash
+sudo install -d -o root -g root -m 0755 /var/www/html/svtplay
 sudo setfacl -m u:www-data:--x "$HOME"
-sudo setfacl -R -m u:www-data:rX "$HOME/svtplay-dl-www"
-sudo find "$HOME/svtplay-dl-www" -type d -exec setfacl -m d:u:www-data:rX {} +
-sudo ln -s "$HOME/svtplay-dl-www" /var/www/html/svtplay
+sudo setfacl -m u:www-data:--x "$HOME/svtplay-dl-www"
+sudo setfacl -m u:www-data:r-- "$HOME/svtplay-dl-www/index.php"
+sudo ln -s "$HOME/svtplay-dl-www/index.php" /var/www/html/svtplay/index.php
 ```
 
-Apache must have `FollowSymLinks` enabled for `/var/www/html`. Check the active Apache configuration if the symlink returns `403 Forbidden`. Confirm that the symlink points to the repository:
+Apache must have `FollowSymLinks` enabled for `/var/www/html`. Check the active Apache configuration if the symlink returns `403 Forbidden`. Confirm that the `svtplay` path is a directory and that its only application entry is the `index.php` symlink:
 
 ```bash
-readlink -f /var/www/html/svtplay
-```
-
-The symlink exposes repository files under the web root. Deny HTTP access to `.git`, Markdown files, and `LICENSE`. Create `/etc/apache2/conf-available/svtplay.conf` with this content:
-
-```apache
-<LocationMatch "^/svtplay/(?:\.git(?:/|$)|.*\.md$|LICENSE$)">
-    Require all denied
-</LocationMatch>
-```
-
-Enable the configuration, validate it, and reload Apache:
-
-```bash
-sudo a2enconf svtplay
-sudo apachectl configtest
-sudo systemctl reload apache2
+ls -l /var/www/html/svtplay
+readlink -f /var/www/html/svtplay/index.php
 ```
 
 ## 7. Configure `index.php` as the directory index
@@ -140,19 +126,19 @@ The page checks the recorded PID against `/proc/<pid>/cmdline` to ensure the pro
 
 ## 10. Uninstall
 
-Disable the Apache access rule, remove the web-root symlink, and reload Apache:
+Remove the `index.php` symlink and the now-empty web directory:
 
 ```bash
-sudo a2disconf svtplay
-sudo apachectl configtest
-sudo systemctl reload apache2
-sudo rm /var/www/html/svtplay
+sudo rm /var/www/html/svtplay/index.php
+sudo rmdir /var/www/html/svtplay
 ```
 
-If an older installation created `/etc/apache2/conf-available/svtplay-auth.conf`, remove that obsolete configuration too:
+No Apache configuration change is needed for the current installation. If an older installation created these configurations, disable each one only if it is enabled, remove the available configuration files, then validate and reload Apache:
 
 ```bash
-sudo a2disconf svtplay-auth
+if [ -e /etc/apache2/conf-enabled/svtplay.conf ]; then sudo a2disconf svtplay; fi
+if [ -e /etc/apache2/conf-enabled/svtplay-auth.conf ]; then sudo a2disconf svtplay-auth; fi
+sudo rm -f /etc/apache2/conf-available/svtplay.conf
 sudo rm -f /etc/apache2/conf-available/svtplay-auth.conf
 sudo apachectl configtest
 sudo systemctl reload apache2

@@ -112,7 +112,7 @@ function normalizeSvtplayUrl(string $input): string
     if ($url === '' || preg_match('/[\x00-\x20\x7f]/', $url) === 1 || preg_match('/%(?:0[0-9a-f]|1[0-9a-f]|7f)/i', $url) === 1) {
         throw new InvalidArgumentException('Enter a valid SVT Play video URL.');
     }
-    if (str_contains($url, '\\')) {
+    if (strpos($url, '\\') !== false) {
         throw new InvalidArgumentException('Backslashes are not allowed in the URL.');
     }
     $parts = parse_url($url);
@@ -481,11 +481,14 @@ function displayedJobStatus(array $job): string
         }
         return 'Process stopped unexpectedly';
     }
-    return match ($status) {
-        'complete' => 'Complete',
-        'failed' => 'Failed',
-        default => ucfirst($status),
-    };
+    switch ($status) {
+        case 'complete':
+            return 'Complete';
+        case 'failed':
+            return 'Failed';
+        default:
+            return ucfirst($status);
+    }
 }
 
 $csrfToken = (string) $_SESSION['csrf_token'];
