@@ -198,6 +198,12 @@ function readJobLogTail(string $jobId): string
     return trim($contents);
 }
 
+function appendJobLog(string $logFile, string $message): void
+{
+    $line = '[' . gmdate(DATE_ATOM) . '] ' . $message . PHP_EOL;
+    file_put_contents($logFile, $line, FILE_APPEND | LOCK_EX);
+}
+
 function spawnJob(string $jobId, string $logFile): int
 {
     $launcher = 'nohup "$1" "$2" --run-job "$3" </dev/null >>"$4" 2>&1 & echo $!';
@@ -225,6 +231,7 @@ function spawnJob(string $jobId, string $logFile): int
 
 function runExternalProcess(string $jobId, string $phase, string $name, array $command, string $jobDirectory, string $logFile): int
 {
+    appendJobLog($logFile, 'Starting ' . $phase . ' process with arguments: ' . json_encode($command, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
     $process = proc_open(
         $command,
         [0 => ['file', '/dev/null', 'r'], 1 => ['file', $logFile, 'a'], 2 => ['file', $logFile, 'a']],
@@ -255,6 +262,7 @@ function runExternalProcess(string $jobId, string $phase, string $name, array $c
     }
     $exitCode = (int) ($status['exitcode'] ?? -1);
     proc_close($process);
+    appendJobLog($logFile, $name . ' process ' . $pid . ' exited with code ' . $exitCode . '.');
     updateJob($jobId, static function (array &$job): void {
         $job['pid'] = null;
         $job['process_name'] = null;
@@ -280,6 +288,11 @@ function locateArtifacts(string $jobDirectory): array
         } elseif (in_array($extension, $subtitleExtensions, true)) {
             $subtitles[] = $file->getPathname();
         }
+    }
+    if ($videos === [] && $subtitles === [] && $files === []) {
+        throw new RuntimeException(
+            'svtplay-dl created no output files. With --require-subtitle, this can mean no subtitles were available. Check the job log.'
+        );
     }
     if (count($videos) !== 1 || count($subtitles) !== 1) {
         sort($files, SORT_NATURAL | SORT_FLAG_CASE);
@@ -366,6 +379,7 @@ if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === '--run-job') {
         $jobId = (string) ($argv[2] ?? '');
         if (preg_match('/^[a-f0-9]{32}$/', $jobId) === 1) {
             try {
+                appendJobLog(JOBS_DIR . '/' . $jobId . '/job.log', 'Job failed: ' . $exception->getMessage());
                 updateJob($jobId, static function (array &$job) use ($exception): void {
                     $job['status'] = 'failed';
                     $job['phase'] = 'failed';
