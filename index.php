@@ -284,7 +284,7 @@ function runJob(string $jobId): void
     }
     ensureStorage();
     $jobDirectory = JOBS_DIR . '/' . $jobId;
-    if (!mkdir($jobDirectory, 0750) && !is_dir($jobDirectory)) {
+    if (!is_dir($jobDirectory) && !mkdir($jobDirectory, 0750, true)) {
         throw new RuntimeException('Could not create the job directory.');
     }
     $logFile = $jobDirectory . '/job.log';
