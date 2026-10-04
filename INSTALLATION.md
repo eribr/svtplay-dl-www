@@ -102,11 +102,34 @@ sudo systemctl reload apache2
 
 Once `index.php` has been implemented, open `http://<webserver>/svtplay`. The URL `http://<webserver>/svtplay/` should also work.
 
-## 8. Restrict network access
+## 8. Configure application authentication
 
-The application has no password prompt or application-level authentication. Anyone who can reach the page can start downloads and consume the Raspberry Pi's bandwidth, CPU, and storage. Keep it on a trusted private network and restrict access to trusted devices with your router or firewall. Do not expose it directly to the public internet.
+The page requires HTTP Basic Authentication for every request. Generate a password hash interactively so the plaintext password is not part of the shell command:
 
-## 9. Verify the application
+```bash
+php -r 'echo password_hash(trim(fgets(STDIN)), PASSWORD_DEFAULT), PHP_EOL;'
+```
+
+Create `/etc/apache2/conf-available/svtplay-auth.conf` and replace the example username and hash with your chosen values:
+
+```apache
+SetEnv SVTPLAY_USERNAME "replace-with-a-username"
+SetEnv SVTPLAY_PASSWORD_HASH "replace-with-the-generated-password-hash"
+```
+
+Enable the configuration, validate Apache, and reload it:
+
+```bash
+sudo a2enconf svtplay-auth
+sudo apachectl configtest
+sudo systemctl reload apache2
+```
+
+## 9. Restrict network access
+
+Authentication is enabled, but keep the service on a trusted private network and restrict access to trusted devices with your router or firewall. Do not expose Basic Authentication over plain HTTP to an untrusted network; configure HTTPS before allowing access outside a trusted, isolated network.
+
+## 10. Verify the application
 
 No systemd service or separately installed worker is required. When a valid URL is submitted, `index.php` starts another CLI instance of itself in the background. That process runs `svtplay-dl`, burns the subtitle into the video with FFmpeg, and updates the PID registry.
 
@@ -124,7 +147,7 @@ ps -eo pid,ppid,user,args | grep -E '[i]ndex.php --run-job|[s]vtplay-dl|[f]fmpeg
 
 The page checks the recorded PID against `/proc/<pid>/cmdline` to ensure the process is the expected job, rather than trusting that a PID merely exists. If Apache returns `403 Forbidden`, check `FollowSymLinks`, ACL permissions on every directory in the path, and the Apache error log. If background jobs do not start, check that PHP CLI and `proc_open` are available to `www-data`, and that `/var/lib/svtplay/downloads` is writable by `www-data`.
 
-## 10. Uninstall
+## 11. Uninstall
 
 Remove the `index.php` symlink and the now-empty web directory:
 
@@ -133,12 +156,10 @@ sudo rm /var/www/html/svtplay/index.php
 sudo rmdir /var/www/html/svtplay
 ```
 
-No Apache configuration change is needed for the current installation. If an older installation created these configurations, disable each one only if it is enabled, remove the available configuration files, then validate and reload Apache:
+Disable the authentication configuration as well, remove its Apache configuration file, then validate and reload Apache:
 
 ```bash
-if [ -e /etc/apache2/conf-enabled/svtplay.conf ]; then sudo a2disconf svtplay; fi
 if [ -e /etc/apache2/conf-enabled/svtplay-auth.conf ]; then sudo a2disconf svtplay-auth; fi
-sudo rm -f /etc/apache2/conf-available/svtplay.conf
 sudo rm -f /etc/apache2/conf-available/svtplay-auth.conf
 sudo apachectl configtest
 sudo systemctl reload apache2

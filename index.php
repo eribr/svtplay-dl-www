@@ -497,6 +497,24 @@ if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === '--run-job') {
     }
 }
 
+$configuredUser = getenv('SVTPLAY_USERNAME');
+$configuredPasswordHash = getenv('SVTPLAY_PASSWORD_HASH');
+$providedUser = $_SERVER['PHP_AUTH_USER'] ?? '';
+$providedPassword = $_SERVER['PHP_AUTH_PW'] ?? '';
+
+if (!is_string($configuredUser) || $configuredUser === ''
+    || !is_string($configuredPasswordHash) || $configuredPasswordHash === '') {
+    http_response_code(503);
+    exit('The application is not configured. Set SVTPLAY_USERNAME and SVTPLAY_PASSWORD_HASH in Apache.');
+}
+
+if (!hash_equals($configuredUser, (string) $providedUser)
+    || !password_verify((string) $providedPassword, $configuredPasswordHash)) {
+    header('WWW-Authenticate: Basic realm="SVT Play Downloader", charset="UTF-8"');
+    http_response_code(401);
+    exit('Authentication required.');
+}
+
 header('X-Content-Type-Options: nosniff');
 header('X-Frame-Options: DENY');
 header('Referrer-Policy: no-referrer');
