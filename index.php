@@ -379,22 +379,56 @@ function locateArtifacts(string $jobDirectory, bool $allowMissingSubtitle = fals
     return [$videos[0], $subtitles[0]];
 }
 
-function finalVideoPath(string $videoPath, string $jobId): string
+function fetchSvtProductionYear(string $svtplayUrl, string $logFile): ?string
+{
+    $urlParts = parse_url($svtplayUrl);
+    if (!is_array($urlParts)
+        || strtolower((string) ($urlParts['scheme'] ?? '')) !== 'https'
+        || !in_array(strtolower((string) ($urlParts['host'] ?? '')), ['svtplay.se', 'www.svtplay.se'], true)) {
+        appendJobLog($logFile, 'Skipping production-year lookup because the URL is not an allowed SVT Play URL.');
+        return null;
+    }
+
+    $context = stream_context_create([
+        'http' => [
+            'method' => 'GET',
+            'timeout' => 8,
+            'follow_location' => 0,
+            'max_redirects' => 0,
+            'ignore_errors' => true,
+            'header' => "User-Agent: SVTPlayDownloader/1.0\r\nAccept: text/html\r\nAccept-Language: sv-SE,sv;q=0.9,en;q=0.5\r\n",
+        ],
+    ]);
+    $html = @file_get_contents($svtplayUrl, false, $context, 0, 4194304);
+    if (!is_string($html) || $html === '') {
+        appendJobLog($logFile, 'Production-year lookup failed or returned an empty page; continuing without a year.');
+        return null;
+    }
+
+    $responseStatus = $http_response_header[0] ?? '';
+    if (preg_match('/^HTTP\/\S+\s+(\d{3})/', $responseStatus, $statusMatches) === 1
+        && (int) $statusMatches[1] !== 200) {
+        appendJobLog($logFile, 'Production-year lookup returned HTTP ' . $statusMatches[1] . '; continuing without a year.');
+        return null;
+    }
+
+    if (preg_match('/"productionYear"\s*:\s*"?((?:18|19|20)\d{2})"?/', $html, $matches) === 1) {
+        $year = (int) $matches[1];
+        if ($year >= 1888 && $year <= (int) gmdate('Y') + 1) {
+            appendJobLog($logFile, 'Found production year ' . $year . ' on the SVT Play page.');
+            return (string) $year;
+        }
+    }
+
+    appendJobLog($logFile, 'No productionYear metadata found on the SVT Play page; continuing without a year.');
+    return null;
+}
+
+function finalVideoPath(string $videoPath, string $jobId, ?string $year): string
 {
     $sourceName = pathinfo($videoPath, PATHINFO_FILENAME);
     $title = preg_replace('/-[a-f0-9]{7}-svtplay$/i', '', $sourceName);
     $title = is_string($title) ? $title : '';
-    $year = null;
-
-    if (preg_match('/(?:^|[ ._\-(])((?:19|20)\d{2})(?:$|[ ._\-)])/', $title, $matches) === 1) {
-        $candidateYear = (int) $matches[1];
-        $currentYear = (int) gmdate('Y');
-        if ($candidateYear >= 1888 && $candidateYear <= $currentYear + 1) {
-            $year = (string) $candidateYear;
-            $title = preg_replace('/(?:^|[ ._\-(])' . preg_quote($year, '/') . '(?:$|[ ._\-)])/', ' ', $title, 1) ?? $title;
-        }
-    }
-
     $title = str_replace(['.', '_'], ' ', $title);
     $title = preg_replace('/[^\pL\pN -]+/u', '', $title) ?? '';
     $title = preg_replace('/\s+/', ' ', trim($title, " \t\n\r\0\x0B-_.")) ?? '';
@@ -477,10 +511,13 @@ function runJob(string $jobId): void
         throw new RuntimeException('svtplay-dl produced no video file, even without subtitle options. Check the job log.');
     }
 
-    $finalPath = finalVideoPath($videoPath, $jobId);
-    updateJob($jobId, static function (array &$storedJob) use ($finalPath): void {
+    updateJob($jobId, static function (array &$storedJob): void {
         $storedJob['status'] = 'finalizing';
         $storedJob['phase'] = 'finalizing';
+    });
+    $productionYear = fetchSvtProductionYear((string) $job['url'], $logFile);
+    $finalPath = finalVideoPath($videoPath, $jobId, $productionYear);
+    updateJob($jobId, static function (array &$storedJob) use ($finalPath): void {
         $storedJob['output'] = $finalPath;
     });
     if (!copy($videoPath, $finalPath) || !is_file($finalPath) || filesize($finalPath) === 0) {
