@@ -68,7 +68,7 @@ The PHP script keeps the PID registry, job records, logs, and temporary media un
 sudo install -d -o www-data -g www-data -m 0750 /var/lib/svtplay/downloads
 ```
 
-The job registry is `/tmp/svtplay-dl-www/jobs.json`; its lock file is `/tmp/svtplay-dl-www/jobs.lock`. Temporary files and per-job logs are under `/tmp/svtplay-dl-www/jobs`. The page's delete action removes a completed or failed job's registry entry, log, and temporary work directory, but preserves the completed video. Otherwise, registry and job data remain until Raspberry Pi OS clears `/tmp`, commonly on reboot. Completed videos are written to `/var/lib/svtplay/downloads` using the title from `svtplay-dl`'s output name, plus a year if present in that title; a job-ID suffix is added only when a title collision would otherwise overwrite an existing file. They remain there until manually deleted.
+The job registry is `/tmp/svtplay-dl-www/jobs.json`; its lock file is `/tmp/svtplay-dl-www/jobs.lock`. Temporary files and per-job logs are under `/tmp/svtplay-dl-www/jobs`. The page's delete action removes a completed or failed job's registry entry, log, and temporary work directory, but preserves the completed video. Completed-job links serve MP4 files through the authenticated PHP endpoint; do not publish `/var/lib/svtplay/downloads` directly through Apache. Otherwise, registry and job data remain until Raspberry Pi OS clears `/tmp`, commonly on reboot. Completed videos are written to `/var/lib/svtplay/downloads` using the title from `svtplay-dl`'s output name, plus a year if present in that title; a job-ID suffix is added only when a title collision would otherwise overwrite an existing file. They remain there until manually deleted.
 
 ## 6. Publish only `index.php`
 

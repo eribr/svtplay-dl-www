@@ -35,6 +35,7 @@ A PHP web page shall let a user start a download from SVT Play using `svtplay-dl
 - Store the PID registry at `/tmp/svtplay-dl-www/jobs.json`, its lock at `/tmp/svtplay-dl-www/jobs.lock`, and per-job work directories/logs under `/tmp/svtplay-dl-www/jobs`. Store completed MP4 files persistently under `/var/lib/svtplay/downloads`.
 - Store the `svtplay-dl` PID in the job record.
 - Show each job's URL, PID, and current phase on the home page, for example `downloading and muxing subtitles`, `saving MP4`, `complete`, or `failed`.
+- For every completed job, provide a direct link from the job list to its MP4. Serve the file through an authenticated endpoint that validates the job ID and completed registry record; do not expose the download directory as a public web directory.
 - For failed jobs and jobs whose process stopped unexpectedly, display an expandable, HTML-escaped tail of the per-job log, bounded to 12 KB.
 - Provide a checkbox for each completed or failed job and a `Delete selected job records and logs` action. Do not allow active jobs to be selected for deletion.
 - Deleting a terminal job shall remove its registry entry, per-job log, and temporary work directory. It shall preserve any completed output video under `/var/lib/svtplay/downloads`.

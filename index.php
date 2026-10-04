@@ -536,6 +536,41 @@ if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === '--run-job') {
     }
 }
 
+if (isset($_GET['download'])) {
+    $requestedJobId = $_GET['download'];
+    if (!is_string($requestedJobId) || preg_match('/^[a-f0-9]{32}$/', $requestedJobId) !== 1) {
+        http_response_code(404);
+        exit('File not found.');
+    }
+    try {
+        $downloadJob = readRegistry()['jobs'][$requestedJobId] ?? null;
+        $downloadPath = is_array($downloadJob) && ($downloadJob['status'] ?? '') === 'complete'
+            ? (string) ($downloadJob['output'] ?? '')
+            : '';
+        $expectedPrefix = DOWNLOADS_DIR . DIRECTORY_SEPARATOR;
+        if ($downloadPath === ''
+            || strpos($downloadPath, $expectedPrefix) !== 0
+            || strtolower(pathinfo($downloadPath, PATHINFO_EXTENSION)) !== 'mp4'
+            || !is_file($downloadPath)
+            || !is_readable($downloadPath)) {
+            http_response_code(404);
+            exit('File not found.');
+        }
+
+        $fileName = basename($downloadPath);
+        header('Content-Type: video/mp4');
+        header('Content-Length: ' . (string) filesize($downloadPath));
+        header('Content-Disposition: inline; filename="' . str_replace(['"', "\\", "\r", "\n"], '', $fileName) . '"; filename*=UTF-8\'\'' . rawurlencode($fileName));
+        header('X-Content-Type-Options: nosniff');
+        readfile($downloadPath);
+        exit;
+    } catch (Throwable $exception) {
+        error_log('SVT Play output serving failed: ' . $exception->getMessage());
+        http_response_code(404);
+        exit('File not found.');
+    }
+}
+
 $configuredUser = getenv('SVTPLAY_USERNAME');
 $configuredPasswordHash = getenv('SVTPLAY_PASSWORD_HASH');
 $providedUser = $_SERVER['PHP_AUTH_USER'] ?? '';
@@ -794,6 +829,8 @@ $hasActiveJobs = count(array_filter(
         .job-select { position: absolute; top: 21px; left: 20px; width: 18px; height: 18px; accent-color: var(--red); }
         .job-url { overflow-wrap: anywhere; font-weight: 650; }
         .job-meta { color: var(--muted); font-size: 13px; }
+        .job-output-link { color: var(--green); font-weight: 700; text-decoration-thickness: 1px; text-underline-offset: 3px; }
+        .job-output-link:hover { color: var(--green-dark); }
         .job-status { align-self: start; padding: 3px 9px; border: 1px solid var(--line); border-radius: 20px; font-size: 12px; font-weight: 700; white-space: nowrap; }
         .job-status.running, .job-status.queued { color: var(--green-dark); border-color: #b9d4c6; background: #edf5ef; }
         .job-status.failed { color: var(--red); border-color: #e8c4c1; background: #fff0ef; }
@@ -877,7 +914,8 @@ $hasActiveJobs = count(array_filter(
                         <?php if (($job['status'] ?? '') === 'failed' && !empty($job['error'])): ?>
                             <div class="job-meta"><?= escapeHtml((string) $job['error']) ?></div>
                         <?php elseif (($job['status'] ?? '') === 'complete' && !empty($job['output'])): ?>
-                            <div class="job-meta">Output: <?= escapeHtml((string) $job['output']) ?></div>
+                            <?php $downloadUrl = '?download=' . rawurlencode($jobId); ?>
+                            <div class="job-meta">Output: <a class="job-output-link" href="<?= escapeHtml($downloadUrl) ?>" target="_blank" rel="noopener"><?= escapeHtml(basename((string) $job['output'])) ?></a></div>
                             <?php if (!empty($job['note'])): ?>
                                 <div class="job-meta"><?= escapeHtml((string) $job['note']) ?></div>
                             <?php endif; ?>
