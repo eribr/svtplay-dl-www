@@ -46,15 +46,19 @@ Verify that the executable runs as the Apache user:
 sudo -u www-data /opt/svtplay-dl-venv/bin/svtplay-dl --version
 ```
 
-## 4. Verify FFmpeg subtitle-filter support
+## 4. Verify FFmpeg availability
 
-FFmpeg needs the `subtitles` video filter, normally provided through libass. Check that the Raspberry Pi OS package includes it:
+`svtplay-dl` uses FFmpeg internally for media post-processing, including combining streams and muxing subtitles as a separate track. The PHP application does not launch an FFmpeg command itself.
 
 ```bash
-ffmpeg -hide_banner -filters 2>&1 | grep subtitles
+ffmpeg -version
 ```
 
-The output should include the `subtitles` filter. The PHP job must run FFmpeg as `www-data` and pass arguments separately rather than constructing a shell command string.
+Verify it is available to the Apache user as well:
+
+```bash
+sudo -u www-data ffmpeg -version
+```
 
 ## 5. Create the persistent download directory
 
@@ -131,12 +135,12 @@ Authentication is enabled, but keep the service on a trusted private network and
 
 ## 10. Verify the application
 
-No systemd service or separately installed worker is required. When a valid URL is submitted, `index.php` starts another CLI instance of itself in the background. That process runs `svtplay-dl`, burns the subtitle into the video with FFmpeg, and updates the PID registry.
+No systemd service or separately installed worker is required. When a valid URL is submitted, `index.php` starts another CLI instance of itself in the background. That process asks `svtplay-dl` to download the video and mux available subtitles as a separate track in an MP4, then records the resulting file and job status. If subtitles are unavailable, it retries without subtitle options and saves an MP4 with no subtitle track.
 
 ```bash
 sudo systemctl status apache2
 sudo -u www-data /opt/svtplay-dl-venv/bin/svtplay-dl --version
-ffmpeg -hide_banner -filters 2>&1 | grep subtitles
+ffmpeg -version
 ```
 
 After submitting a job, inspect registered PIDs with `ps` if needed:

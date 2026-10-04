@@ -8,7 +8,6 @@ const JOBS_DIR = DATA_DIR . '/jobs';
 const DOWNLOADS_DIR = '/var/lib/svtplay/downloads';
 const PHP_CLI_BIN = '/usr/bin/php';
 const SVTPLAY_BIN = '/opt/svtplay-dl-venv/bin/svtplay-dl';
-const FFMPEG_BIN = '/usr/bin/ffmpeg';
 const POLL_INTERVAL_SECONDS = 60;
 const PROCESS_CHECK_INTERVAL_SECONDS = 1;
 const STARTUP_CHECK_INTERVAL_SECONDS = 1;
@@ -405,8 +404,8 @@ function finalVideoPath(string $videoPath, string $jobId): string
 
     $baseName = $title . ($year !== null ? ' (' . $year . ')' : '');
     $candidates = [
-        DOWNLOADS_DIR . '/' . $baseName . '.mkv',
-        DOWNLOADS_DIR . '/' . $baseName . ' [' . $jobId . '].mkv',
+        DOWNLOADS_DIR . '/' . $baseName . '.mp4',
+        DOWNLOADS_DIR . '/' . $baseName . ' [' . $jobId . '].mp4',
     ];
     foreach ($candidates as $candidate) {
         $reservation = @fopen($candidate, 'x');
@@ -446,7 +445,9 @@ function runJob(string $jobId): void
         SVTPLAY_BIN,
         '--filename', '{title}.{ext}',
         '--subtitle',
+        '--merge-subtitle',
         '--require-subtitle',
+        '--output-format', 'mp4',
         '--output',
         $jobDirectory . '/',
         (string) $job['url'],
@@ -461,6 +462,7 @@ function runJob(string $jobId): void
         $fallbackCommand = [
             SVTPLAY_BIN,
             '--filename', '{title}.{ext}',
+            '--output-format', 'mp4',
             '--output',
             $jobDirectory . '/',
             (string) $job['url'],
@@ -475,37 +477,19 @@ function runJob(string $jobId): void
         throw new RuntimeException('svtplay-dl produced no video file, even without subtitle options. Check the job log.');
     }
 
-    $safeSubtitlePath = null;
-    if ($subtitlePath !== null) {
-        $subtitleExtension = strtolower(pathinfo($subtitlePath, PATHINFO_EXTENSION));
-        if (!in_array($subtitleExtension, ['srt', 'vtt', 'ass', 'ssa'], true)) {
-            throw new RuntimeException('The downloaded subtitle format is not supported.');
-        }
-        $safeSubtitlePath = $jobDirectory . '/subtitle.' . $subtitleExtension;
-        if (!copy($subtitlePath, $safeSubtitlePath)) {
-            throw new RuntimeException('Could not prepare the subtitle file for FFmpeg.');
-        }
-    }
     $finalPath = finalVideoPath($videoPath, $jobId);
     updateJob($jobId, static function (array &$storedJob) use ($finalPath): void {
+        $storedJob['status'] = 'finalizing';
+        $storedJob['phase'] = 'finalizing';
         $storedJob['output'] = $finalPath;
     });
-    $ffmpegCommand = [FFMPEG_BIN, '-nostdin', '-y', '-i', $videoPath];
-    if ($safeSubtitlePath !== null) {
-        $ffmpegCommand = array_merge($ffmpegCommand, [
-            '-vf', 'subtitles=' . $safeSubtitlePath,
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '24', '-c:a', 'copy',
-        ]);
-    } else {
-        $ffmpegCommand = array_merge($ffmpegCommand, ['-c', 'copy']);
+    if (!copy($videoPath, $finalPath) || !is_file($finalPath) || filesize($finalPath) === 0) {
+        if (is_file($finalPath)) {
+            unlink($finalPath);
+        }
+        throw new RuntimeException('Could not copy the completed MP4 to the downloads directory. Check the job log.');
     }
-    $ffmpegCommand[] = $finalPath;
-    $ffmpegPhase = $safeSubtitlePath !== null ? 'burning' : 'finalizing';
-    $ffmpegExitCode = runExternalProcess($jobId, $ffmpegPhase, 'ffmpeg', $ffmpegCommand, $jobDirectory, $logFile);
-    if ($ffmpegExitCode !== 0 || !is_file($finalPath) || filesize($finalPath) === 0) {
-        throw new RuntimeException('FFmpeg subtitle burn-in failed. Check the job log.');
-    }
-    foreach ([$videoPath, $subtitlePath, $safeSubtitlePath] as $temporaryFile) {
+    foreach ([$videoPath, $subtitlePath] as $temporaryFile) {
         if (!is_string($temporaryFile)) {
             continue;
         }
@@ -513,7 +497,7 @@ function runJob(string $jobId): void
             unlink($temporaryFile);
         }
     }
-    $completionNote = $safeSubtitlePath === null ? 'No subtitles were available; video saved without burned-in subtitles.' : null;
+    $completionNote = $subtitlePath === null ? 'No subtitles were available; video saved without an extra subtitle track.' : null;
     updateJob($jobId, static function (array &$storedJob) use ($finalPath, $completionNote): void {
         $storedJob['status'] = 'complete';
         $storedJob['phase'] = 'complete';
@@ -716,13 +700,16 @@ function displayedJobStatus(array $job): string
         }
         return 'Process stopped unexpectedly';
     }
-    if (in_array($status, ['downloading', 'burning', 'finalizing'], true)) {
+    if (in_array($status, ['downloading', 'finalizing'], true)) {
         $jobId = (string) ($job['id'] ?? '');
         $workerPid = filter_var($job['worker_pid'] ?? null, FILTER_VALIDATE_INT);
         $workerIsRunning = preg_match('/^[a-f0-9]{32}$/', $jobId) === 1
             && $workerPid !== false
             && processIsExpected((int) $workerPid, 'php', [__FILE__, '--run-job', $jobId]);
-        $expectedName = ($job['process_name'] ?? '') === 'ffmpeg' ? 'ffmpeg' : 'svtplay-dl';
+        if ($status === 'finalizing' && $workerIsRunning) {
+            return 'Saving MP4';
+        }
+        $expectedName = 'svtplay-dl';
         $pid = filter_var($job['pid'] ?? null, FILTER_VALIDATE_INT);
         if ($pid === false || $pid === null) {
             return $workerIsRunning ? 'Starting' : 'Process stopped unexpectedly';
@@ -731,14 +718,9 @@ function displayedJobStatus(array $job): string
             return 'Process stopped unexpectedly';
         }
         $jobDirectory = DATA_DIR . '/jobs/' . $jobId;
-        $requiredArguments = $status === 'downloading'
-            ? [SVTPLAY_BIN, '--filename', '{title}.{ext}', '--output', $jobDirectory . '/', (string) ($job['url'] ?? '')]
-            : [(string) ($job['output'] ?? '')];
+        $requiredArguments = [SVTPLAY_BIN, '--filename', '{title}.{ext}', '--output-format', 'mp4', '--output', $jobDirectory . '/', (string) ($job['url'] ?? '')];
         if ($workerIsRunning && processIsExpected((int) $pid, $expectedName, $requiredArguments)) {
-            if ($status === 'downloading') {
-                return 'Downloading';
-            }
-            return $status === 'burning' ? 'Burning subtitles' : 'Finalizing video';
+            return $status === 'finalizing' ? 'Saving MP4' : 'Downloading / merging subtitles';
         }
         return 'Process stopped unexpectedly';
     }
@@ -755,7 +737,7 @@ function displayedJobStatus(array $job): string
 $csrfToken = (string) $_SESSION['csrf_token'];
 $hasActiveJobs = count(array_filter(
     $jobs,
-    static fn (array $job): bool => in_array($job['status'] ?? '', ['queued', 'starting', 'downloading', 'burning', 'finalizing'], true)
+    static fn (array $job): bool => in_array($job['status'] ?? '', ['queued', 'starting', 'downloading', 'finalizing'], true)
 )) > 0;
 ?>
 <!doctype html>
@@ -878,7 +860,7 @@ $hasActiveJobs = count(array_filter(
                     $statusLabel = displayedJobStatus($job);
                     $statusClass = $statusLabel === 'Process stopped unexpectedly'
                         ? 'failed'
-                        : (in_array($job['status'] ?? '', ['queued', 'starting', 'downloading', 'burning', 'finalizing'], true) ? 'running' : escapeHtml((string) ($job['status'] ?? 'unknown')));
+                        : (in_array($job['status'] ?? '', ['queued', 'starting', 'downloading', 'finalizing'], true) ? 'running' : escapeHtml((string) ($job['status'] ?? 'unknown')));
                     $displayPid = $job['pid'] ?? $job['worker_pid'] ?? 'pending';
                     $showLog = ($job['status'] ?? '') === 'failed' || $statusLabel === 'Process stopped unexpectedly';
                     $jobLog = $showLog ? readJobLogTail((string) ($job['id'] ?? '')) : '';
