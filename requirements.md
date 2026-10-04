@@ -37,8 +37,8 @@ A PHP web page shall let a user start a download from SVT Play using `svtplay-dl
 - Show each job's URL, PID, and current phase on the home page, for example `downloading and muxing subtitles`, `saving MP4`, `complete`, or `failed`.
 - For every completed job, provide a direct link from the job list to its MP4. Serve the file through an authenticated endpoint that validates the job ID and completed registry record; do not expose the download directory as a public web directory.
 - For failed jobs and jobs whose process stopped unexpectedly, display an expandable, HTML-escaped tail of the per-job log, bounded to 12 KB.
-- Provide a checkbox for each completed or failed job and a `Delete selected job records and logs` action. Do not allow active jobs to be selected for deletion.
-- Deleting a terminal job shall remove its registry entry, per-job log, and temporary work directory. It shall preserve any completed output video under `/var/lib/svtplay/downloads`.
+- Provide a checkbox for each completed or failed job and a `Delete selected jobs, logs, and movies` action. Do not allow active jobs to be selected for deletion.
+- Deleting a terminal job shall remove its registry entry, per-job log, temporary work directory, and any associated MP4 output under `/var/lib/svtplay/downloads`.
 - Check active PIDs when rendering the page by comparing them with Raspberry Pi OS process information at `/proc/<pid>/cmdline`. Verify the expected command and job-specific arguments so PID reuse cannot make an unrelated process appear active.
 - Report process-start failures to the user and do not register a failed start as an active job.
 - Concurrent POST requests must not overwrite or corrupt the job history.

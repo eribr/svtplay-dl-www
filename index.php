@@ -237,8 +237,9 @@ function deleteSelectedJobs(array $submittedIds): array
     }
 
     $deletedIds = [];
+    $outputPaths = [];
     $skippedCount = 0;
-    updateRegistry(static function (array &$registry) use ($selectedIds, &$deletedIds, &$skippedCount): void {
+    updateRegistry(static function (array &$registry) use ($selectedIds, &$deletedIds, &$outputPaths, &$skippedCount): void {
         foreach (array_keys($selectedIds) as $jobId) {
             if (!isset($registry['jobs'][$jobId])) {
                 continue;
@@ -247,6 +248,19 @@ function deleteSelectedJobs(array $submittedIds): array
             if (!in_array($status, ['complete', 'failed'], true)) {
                 $skippedCount++;
                 continue;
+            }
+            $outputPath = $registry['jobs'][$jobId]['output'] ?? null;
+            if (is_string($outputPath) && $outputPath !== '') {
+                $expectedPrefix = DOWNLOADS_DIR . DIRECTORY_SEPARATOR;
+                $outputName = substr($outputPath, strlen($expectedPrefix));
+                if (strpos($outputPath, $expectedPrefix) !== 0
+                    || $outputName === ''
+                    || basename($outputName) !== $outputName
+                    || strtolower(pathinfo($outputName, PATHINFO_EXTENSION)) !== 'mp4') {
+                    $skippedCount++;
+                    continue;
+                }
+                $outputPaths[$jobId] = $outputPath;
             }
             unset($registry['jobs'][$jobId]);
             $deletedIds[] = $jobId;
@@ -257,6 +271,9 @@ function deleteSelectedJobs(array $submittedIds): array
     foreach ($deletedIds as $jobId) {
         try {
             removeJobPath(JOBS_DIR . '/' . $jobId);
+            if (isset($outputPaths[$jobId])) {
+                removeJobPath($outputPaths[$jobId]);
+            }
         } catch (Throwable $exception) {
             $cleanupErrors[] = $jobId . ': ' . $exception->getMessage();
         }
@@ -658,7 +675,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 throw new InvalidArgumentException('The selected job list is invalid.');
             }
             [$deletedCount, $skippedCount, $cleanupErrors] = deleteSelectedJobs($submittedIds);
-            $flashMessage = 'Deleted ' . $deletedCount . ' job record(s), logs, and temporary files. Completed videos were kept.';
+            $flashMessage = 'Deleted ' . $deletedCount . ' job(s), logs, temporary files, and associated MP4 files.';
             if ($skippedCount > 0) {
                 $flashMessage .= ' Skipped ' . $skippedCount . ' active job(s).';
             }
@@ -919,7 +936,7 @@ $hasActiveJobs = count(array_filter(
             <input type="hidden" name="action" value="delete_selected">
             <?php if ($jobs !== []): ?>
                 <div class="job-actions">
-                    <button class="job-delete-button" type="submit">Delete selected job records and logs</button>
+                    <button class="job-delete-button" type="submit">Delete selected jobs, logs, and movies</button>
                 </div>
             <?php endif; ?>
             <div class="panel job-list">
