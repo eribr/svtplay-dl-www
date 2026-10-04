@@ -452,6 +452,9 @@ function finalVideoPath(string $videoPath, string $jobId, ?string $year): string
     if ($title === '') {
         $title = 'SVT Play video';
     }
+    $title = preg_replace_callback('/(^|[\s-])(\p{L})/u', static function (array $matches): string {
+        return $matches[1] . mb_strtoupper($matches[2], 'UTF-8');
+    }, $title) ?? $title;
 
     $baseName = $title . ($year !== null ? ' (' . $year . ')' : '');
     $candidates = [

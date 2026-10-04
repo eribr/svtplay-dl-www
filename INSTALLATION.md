@@ -6,7 +6,7 @@ These instructions apply only to a Raspberry Pi running Raspberry Pi OS (64-bit 
 
 ```bash
 sudo apt update
-sudo apt install -y apache2 libapache2-mod-php php-cli python3 python3-venv python3-pip ffmpeg git acl
+sudo apt install -y apache2 libapache2-mod-php php-cli php-mbstring python3 python3-venv python3-pip ffmpeg git acl
 sudo systemctl enable --now apache2
 ```
 

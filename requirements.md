@@ -29,6 +29,7 @@ A PHP web page shall let a user start a download from SVT Play using `svtplay-dl
 - Pass `--subtitle` (`-S`), `--merge-subtitle` (`-M`), and `--require-subtitle` to `svtplay-dl` so available subtitles are muxed into the media as a separate selectable track. Do not burn subtitles into the picture.
 - Pass `--output-format mp4`, `--filename {title}.{ext}`, and `--output <JOB_DIRECTORY>` to `svtplay-dl` so generated MP4 artifacts are confined to the job's private directory and use a clean title-based name.
 - Use the resulting title as the base name of the final MP4. As a best-effort final metadata step, fetch the original SVT Play URL and read its `productionYear` field. Include a valid four-digit year when available; if the request fails or no year is present, log that fact and continue without a year. This lookup must never fail the media job. If a file with that title already exists, append the job ID to avoid overwriting it.
+- Capitalize the first letter of each word in the final filename, including words separated by spaces or hyphens, using Unicode-aware casing.
 - Do not launch an FFmpeg process from PHP. Let `svtplay-dl` handle media remuxing and subtitle-track muxing internally. PHP shall copy the completed MP4 into the persistent downloads directory and mark the job complete only after the copy succeeds.
 - If the subtitle-required attempt produces no recognized video or subtitle artifacts because subtitles are unavailable, retry `svtplay-dl` without subtitle options, still requesting MP4, and complete the job with a visible note that no subtitle track is present. Other download failures shall mark the job failed. Document the temporary-file handling policy.
 - Store at least the normalized URL and PID for every started job on disk. The data shall persist after the PHP request ends and be available on the next page view.
@@ -64,7 +65,7 @@ A PHP web page shall let a user start a download from SVT Play using `svtplay-dl
 ## Runtime requirements
 
 - The documented target platform is a Raspberry Pi running Raspberry Pi OS, with Apache and PHP.
-- Use PHP 7.4 or later with PHP CLI and `proc_open` enabled. A currently security-supported PHP 8.x release is recommended. No systemd service is required.
+- Use PHP 7.4 or later with PHP CLI, `proc_open`, and the `mbstring` extension enabled. A currently security-supported PHP 8.x release is recommended. No systemd service is required.
 - PHP must be able to start external processes and read/write the job registry.
 - `svtplay-dl` must be installed and available to the system user running PHP.
 - `ffmpeg` must be installed and available to the same system user because `svtplay-dl` uses it internally for media post-processing.
