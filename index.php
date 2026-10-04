@@ -413,7 +413,9 @@ function fetchSvtProductionYear(string $svtplayUrl, string $logFile): ?string
             'follow_location' => 0,
             'max_redirects' => 0,
             'ignore_errors' => true,
-            'header' => "User-Agent: SVTPlayDownloader/1.0\r\nAccept: text/html\r\nAccept-Language: sv-SE,sv;q=0.9,en;q=0.5\r\n",
+            'header' => "User-Agent: SVTPlayDownloader/1.0\r\nAccept: text/html\r\nAccept-Language: sv-SE,sv;q=0.9,en;q=0.5\r\nCookie: cookie-consent-2="
+                . rawurlencode('{"version":2,"categories":{"required":true,"improved_experience":false,"partners":false}}')
+                . "\r\n",
         ],
     ]);
     $html = @file_get_contents($svtplayUrl, false, $context, 0, 4194304);
