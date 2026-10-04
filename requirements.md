@@ -28,6 +28,7 @@ A PHP web page shall let a user start a download from SVT Play using `svtplay-dl
 - `index.php` shall support both HTTP mode and a private CLI job mode. An HTTP POST shall start a detached CLI instance of `index.php` and return without waiting for the download. No separate PHP worker script or systemd service is required.
 - First pass `--subtitle` (`-S`) and `--require-subtitle` to `svtplay-dl` to download subtitles when available; if that attempt produces no files because subtitles are unavailable, use the documented video-only fallback.
 - Pass `--output <JOB_DIRECTORY>` to `svtplay-dl` so generated artifacts are confined to the job's private directory.
+- Pass `--filename {title}.{ext}` to `svtplay-dl` and use the resulting title as the base name of the final video. Include a four-digit year when it is present in available title metadata; do not invent a year when unavailable. If a file with that title already exists, append the job ID to avoid overwriting it.
 - Burn subtitles into the video in a separate post-processing step using FFmpeg's `subtitles` video filter. `svtplay-dl --merge-subtitle` muxes subtitles into the media file and does not burn them into the video frames.
 - Run FFmpeg only after the video and subtitle file have downloaded successfully. Write a separate final output file, and do not mark the job complete until FFmpeg exits successfully.
 - Start FFmpeg without shell interpretation as well. Keep input files in the controlled job directory and write the final output to the configured downloads directory; user-provided URLs must not affect file paths.
@@ -85,6 +86,7 @@ A PHP web page shall let a user start a download from SVT Play using `svtplay-dl
 - The application shall consist of one PHP source file, `index.php`. On page reload, a job is shown as running only while its registered worker/child PIDs match the expected live processes; otherwise it is not shown as running.
 - The job remains active during both downloading and FFmpeg processing, and is complete only after the final video with burned-in subtitles has been created.
 - When no subtitles are available, the fallback job completes with a video-only output and a visible note that subtitles were unavailable.
+- The completed output filename is based on the film title, includes an available year, and uses the job ID only to disambiguate collisions.
 - GET never starts a job.
 - URLs with an incorrect scheme, foreign host, invalid/ambiguous path, control characters, or CLI/shell injection attempts are rejected; no URL component can become an extra argument or command.
 - Two concurrent job starts leave a readable registry containing both jobs.

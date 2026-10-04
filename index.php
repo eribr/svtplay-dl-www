@@ -380,6 +380,44 @@ function locateArtifacts(string $jobDirectory, bool $allowMissingSubtitle = fals
     return [$videos[0], $subtitles[0]];
 }
 
+function finalVideoPath(string $videoPath, string $jobId): string
+{
+    $sourceName = pathinfo($videoPath, PATHINFO_FILENAME);
+    $title = preg_replace('/-[a-f0-9]{7}-svtplay$/i', '', $sourceName);
+    $title = is_string($title) ? $title : '';
+    $year = null;
+
+    if (preg_match('/(?:^|[ ._\-(])((?:19|20)\d{2})(?:$|[ ._\-)])/', $title, $matches) === 1) {
+        $candidateYear = (int) $matches[1];
+        $currentYear = (int) gmdate('Y');
+        if ($candidateYear >= 1888 && $candidateYear <= $currentYear + 1) {
+            $year = (string) $candidateYear;
+            $title = preg_replace('/(?:^|[ ._\-(])' . preg_quote($year, '/') . '(?:$|[ ._\-)])/', ' ', $title, 1) ?? $title;
+        }
+    }
+
+    $title = str_replace(['.', '_'], ' ', $title);
+    $title = preg_replace('/[^\pL\pN -]+/u', '', $title) ?? '';
+    $title = preg_replace('/\s+/', ' ', trim($title, " \t\n\r\0\x0B-_.")) ?? '';
+    if ($title === '') {
+        $title = 'SVT Play video';
+    }
+
+    $baseName = $title . ($year !== null ? ' (' . $year . ')' : '');
+    $candidates = [
+        DOWNLOADS_DIR . '/' . $baseName . '.mkv',
+        DOWNLOADS_DIR . '/' . $baseName . ' [' . $jobId . '].mkv',
+    ];
+    foreach ($candidates as $candidate) {
+        $reservation = @fopen($candidate, 'x');
+        if ($reservation !== false) {
+            fclose($reservation);
+            return $candidate;
+        }
+    }
+    throw new RuntimeException('Could not reserve a unique output filename.');
+}
+
 function runJob(string $jobId): void
 {
     if (preg_match('/^[a-f0-9]{32}$/', $jobId) !== 1) {
@@ -404,7 +442,15 @@ function runJob(string $jobId): void
         throw new RuntimeException('Could not create the job directory.');
     }
     $logFile = $jobDirectory . '/job.log';
-    $downloadCommand = [SVTPLAY_BIN, '--subtitle', '--require-subtitle', '--output', $jobDirectory . '/', (string) $job['url']];
+    $downloadCommand = [
+        SVTPLAY_BIN,
+        '--filename', '{title}.{ext}',
+        '--subtitle',
+        '--require-subtitle',
+        '--output',
+        $jobDirectory . '/',
+        (string) $job['url'],
+    ];
     $downloadExitCode = runExternalProcess($jobId, 'downloading', 'svtplay-dl', $downloadCommand, $jobDirectory, $logFile);
     if ($downloadExitCode !== 0) {
         throw new RuntimeException('svtplay-dl failed with exit code ' . $downloadExitCode . '. Check the job log.');
@@ -412,7 +458,13 @@ function runJob(string $jobId): void
     [$videoPath, $subtitlePath] = locateArtifacts($jobDirectory, true);
     if ($videoPath === null && $subtitlePath === null) {
         appendJobLog($logFile, 'No video or subtitle artifacts were produced with --require-subtitle; retrying without subtitle options.');
-        $fallbackCommand = [SVTPLAY_BIN, '--output', $jobDirectory . '/', (string) $job['url']];
+        $fallbackCommand = [
+            SVTPLAY_BIN,
+            '--filename', '{title}.{ext}',
+            '--output',
+            $jobDirectory . '/',
+            (string) $job['url'],
+        ];
         $fallbackExitCode = runExternalProcess($jobId, 'downloading', 'svtplay-dl', $fallbackCommand, $jobDirectory, $logFile);
         if ($fallbackExitCode !== 0) {
             throw new RuntimeException('svtplay-dl failed without subtitle options, exit code ' . $fallbackExitCode . '. Check the job log.');
@@ -434,7 +486,10 @@ function runJob(string $jobId): void
             throw new RuntimeException('Could not prepare the subtitle file for FFmpeg.');
         }
     }
-    $finalPath = DOWNLOADS_DIR . '/' . $jobId . '.mkv';
+    $finalPath = finalVideoPath($videoPath, $jobId);
+    updateJob($jobId, static function (array &$storedJob) use ($finalPath): void {
+        $storedJob['output'] = $finalPath;
+    });
     $ffmpegCommand = [FFMPEG_BIN, '-nostdin', '-y', '-i', $videoPath];
     if ($safeSubtitlePath !== null) {
         $ffmpegCommand = array_merge($ffmpegCommand, [
@@ -677,8 +732,8 @@ function displayedJobStatus(array $job): string
         }
         $jobDirectory = DATA_DIR . '/jobs/' . $jobId;
         $requiredArguments = $status === 'downloading'
-            ? [SVTPLAY_BIN, '--output', $jobDirectory . '/', (string) ($job['url'] ?? '')]
-            : [DOWNLOADS_DIR . '/' . $jobId . '.mkv'];
+            ? [SVTPLAY_BIN, '--filename', '{title}.{ext}', '--output', $jobDirectory . '/', (string) ($job['url'] ?? '')]
+            : [(string) ($job['output'] ?? '')];
         if ($workerIsRunning && processIsExpected((int) $pid, $expectedName, $requiredArguments)) {
             if ($status === 'downloading') {
                 return 'Downloading';
