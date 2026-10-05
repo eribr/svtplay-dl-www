@@ -419,27 +419,61 @@ function fetchSvtProductionYear(string $svtplayUrl, string $logFile): ?string
         ],
     ]);
     $html = @file_get_contents($svtplayUrl, false, $context, 0, 4194304);
-    if (!is_string($html) || $html === '') {
-        appendJobLog($logFile, 'Production-year lookup failed or returned an empty page; continuing without a year.');
-        return null;
-    }
-
-    $responseStatus = $http_response_header[0] ?? '';
-    if (preg_match('/^HTTP\/\S+\s+(\d{3})/', $responseStatus, $statusMatches) === 1
-        && (int) $statusMatches[1] !== 200) {
-        appendJobLog($logFile, 'Production-year lookup returned HTTP ' . $statusMatches[1] . '; continuing without a year.');
-        return null;
-    }
-
-    if (preg_match('/"productionYear"\s*:\s*"?((?:18|19|20)\d{2})"?/', $html, $matches) === 1) {
-        $year = (int) $matches[1];
-        if ($year >= 1888 && $year <= (int) gmdate('Y') + 1) {
-            appendJobLog($logFile, 'Found production year ' . $year . ' on the SVT Play page.');
-            return (string) $year;
+    $responseHeaders = isset($http_response_header) && is_array($http_response_header)
+        ? $http_response_header
+        : [];
+    $responseStatus = $responseHeaders[0] ?? '(no HTTP status)';
+    $contentType = '(unknown)';
+    $location = null;
+    foreach ($responseHeaders as $responseHeader) {
+        if (stripos($responseHeader, 'Content-Type:') === 0) {
+            $contentType = trim(substr($responseHeader, strlen('Content-Type:')));
+        } elseif (stripos($responseHeader, 'Location:') === 0) {
+            $location = trim(substr($responseHeader, strlen('Location:')));
         }
     }
 
-    appendJobLog($logFile, 'No productionYear metadata found on the SVT Play page; continuing without a year.');
+    if (!is_string($html) || $html === '') {
+        appendJobLog($logFile, 'Production-year lookup returned no body. HTTP: ' . $responseStatus . '; Content-Type: ' . $contentType . ($location !== null ? '; Location: ' . $location : '') . '. Continuing without a year.');
+        return null;
+    }
+
+    if (preg_match('/^HTTP\/\S+\s+(\d{3})/', $responseStatus, $statusMatches) === 1
+        && (int) $statusMatches[1] !== 200) {
+        appendJobLog($logFile, 'Production-year lookup returned HTTP ' . $statusMatches[1] . '; Content-Type: ' . $contentType . ($location !== null ? '; Location: ' . $location : '') . '; body bytes: ' . strlen($html) . '. Continuing without a year.');
+        return null;
+    }
+
+    appendJobLog($logFile, 'Production-year page response: HTTP ' . $responseStatus . '; Content-Type: ' . $contentType . '; body bytes: ' . strlen($html) . '.');
+
+    $yearPatterns = [
+        '/"label"\s*:\s*"Produktionsår"\s*,\s*"value"\s*:\s*"?((?:18|19|20)\d{2})"?/u',
+        '/"value"\s*:\s*"?((?:18|19|20)\d{2})"?\s*,\s*"label"\s*:\s*"Produktionsår"/u',
+        '/"productionYear"\s*:\s*"?((?:18|19|20)\d{2})"?/u',
+    ];
+    foreach ($yearPatterns as $yearPattern) {
+        if (preg_match($yearPattern, $html, $matches) === 1) {
+            $year = (int) $matches[1];
+            if ($year >= 1888 && $year <= (int) gmdate('Y') + 1) {
+                appendJobLog($logFile, 'Found production year ' . $year . ' in the SVT Play page metadata.');
+                return (string) $year;
+            }
+        }
+    }
+
+    $diagnosticSnippets = [];
+    foreach (['publishingDetails', 'Produktionsår', 'productionYear', '2018'] as $needle) {
+        $position = stripos($html, $needle);
+        if ($position !== false) {
+            $start = max(0, $position - 300);
+            $diagnosticSnippets[] = '[' . $needle . '] ' . substr($html, $start, 900);
+        }
+    }
+    if ($diagnosticSnippets === []) {
+        $diagnosticSnippets[] = '[response start] ' . substr($html, 0, 1600);
+    }
+    appendJobLog($logFile, 'No production-year pattern matched. HTML excerpts (bounded): ' . json_encode($diagnosticSnippets, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    appendJobLog($logFile, 'No production-year metadata found on the SVT Play page; continuing without a year.');
     return null;
 }
 
