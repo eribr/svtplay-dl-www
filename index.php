@@ -446,13 +446,15 @@ function fetchSvtProductionYear(string $svtplayUrl, string $logFile): ?string
 
     appendJobLog($logFile, 'Production-year page response: HTTP ' . $responseStatus . '; Content-Type: ' . $contentType . '; body bytes: ' . strlen($html) . '.');
 
+    // SVT embeds serialized GraphQL data inside another JSON payload, escaping its quotes.
+    $metadataHtml = str_replace('\\"', '"', $html);
     $yearPatterns = [
         '/"label"\s*:\s*"Produktionsår"\s*,\s*"value"\s*:\s*"?((?:18|19|20)\d{2})"?/u',
         '/"value"\s*:\s*"?((?:18|19|20)\d{2})"?\s*,\s*"label"\s*:\s*"Produktionsår"/u',
         '/"productionYear"\s*:\s*"?((?:18|19|20)\d{2})"?/u',
     ];
     foreach ($yearPatterns as $yearPattern) {
-        if (preg_match($yearPattern, $html, $matches) === 1) {
+        if (preg_match($yearPattern, $metadataHtml, $matches) === 1) {
             $year = (int) $matches[1];
             if ($year >= 1888 && $year <= (int) gmdate('Y') + 1) {
                 appendJobLog($logFile, 'Found production year ' . $year . ' in the SVT Play page metadata.');
@@ -463,10 +465,10 @@ function fetchSvtProductionYear(string $svtplayUrl, string $logFile): ?string
 
     $diagnosticSnippets = [];
     foreach (['publishingDetails', 'Produktionsår', 'productionYear', '2018'] as $needle) {
-        $position = stripos($html, $needle);
+        $position = stripos($metadataHtml, $needle);
         if ($position !== false) {
             $start = max(0, $position - 300);
-            $diagnosticSnippets[] = '[' . $needle . '] ' . substr($html, $start, 900);
+            $diagnosticSnippets[] = '[' . $needle . '] ' . substr($metadataHtml, $start, 900);
         }
     }
     if ($diagnosticSnippets === []) {
