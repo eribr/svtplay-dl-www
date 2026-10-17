@@ -116,14 +116,26 @@ function normalizeSvtplayUrl(string $input): string
     if (strpos($url, '\\') !== false) {
         throw new InvalidArgumentException('Backslashes are not allowed in the URL.');
     }
+    return $url
+}
+
+function normalizeSvtplayUrlSTRICTUnused(string $input): string
+{
+    $url = trim($input);
+    if ($url === '' || preg_match('/[\x00-\x20\x7f]/', $url) === 1 || preg_match('/%(?:0[0-9a-f]|1[0-9a-f]|7f)/i', $url) === 1) {
+        throw new InvalidArgumentException('Enter a valid SVT Play video URL.');
+    }
+    if (strpos($url, '\\') !== false) {
+        throw new InvalidArgumentException('Backslashes are not allowed in the URL.');
+    }
     $parts = parse_url($url);
     if (!is_array($parts)
         || strtolower((string) ($parts['scheme'] ?? '')) !== 'https'
-        || !in_array(strtolower((string) ($parts['host'] ?? '')), ['svtplay.se', 'www.svtplay.se'], true)
+        || !in_array(strtolower((string) ($parts['host'] ?? '')), ['svtplay.se', 'www.svtplay.se', 'tv4play.se', 'www.tv4play.se'], true)
         || isset($parts['user'])
         || isset($parts['pass'])
         || isset($parts['port'])) {
-        throw new InvalidArgumentException('Only HTTPS URLs from svtplay.se are accepted.');
+        throw new InvalidArgumentException('Only HTTPS URLs from svtplay.se and tv4play.se are accepted.');
     }
     $path = (string) ($parts['path'] ?? '');
     if (preg_match('~^/video/([A-Za-z0-9]+)(?:/([A-Za-z0-9-]+))?/?$~D', $path, $matches) !== 1) {
