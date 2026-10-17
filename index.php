@@ -107,27 +107,36 @@ function updateJob(string $jobId, callable $update): void
     });
 }
 
-function normalizeSvtplayUrl(string $input): string
+/**
+ * Sanitize (not normalize) a video URL submitted by the user.
+ *
+ * This is a security boundary, not canonicalization: the URL is returned as-is
+ * and never rewritten. It is later handed to svtplay-dl as a single argv
+ * element through proc_open() with bypass_shell, so no shell ever interprets
+ * it; the checks below are defense in depth against argument/terminal
+ * manipulation and keep the tool from being used as a generic downloader.
+ *
+ * The path is deliberately left untouched so both SVT's /video/... pages and
+ * TV4's /program/... pages are accepted without per-site path rules.
+ */
+function sanitizeDownloadUrl(string $input): string
 {
     $url = trim($input);
-    if ($url === '' || preg_match('/[\x00-\x20\x7f]/', $url) === 1 || preg_match('/%(?:0[0-9a-f]|1[0-9a-f]|7f)/i', $url) === 1) {
-        throw new InvalidArgumentException('Enter a valid SVT Play video URL.');
+    if ($url === '') {
+        throw new InvalidArgumentException('Enter a valid SVT Play or TV4 Play video URL.');
+    }
+    // Reject raw control characters, DEL, and percent-encoded control
+    // characters. These can smuggle data past filters or manipulate how the
+    // value is split into arguments.
+    if (preg_match('/[\x00-\x20\x7f]/', $url) === 1
+        || preg_match('/%(?:0[0-9a-f]|1[0-9a-f]|7f)/i', $url) === 1) {
+        throw new InvalidArgumentException('Enter a valid SVT Play or TV4 Play video URL.');
     }
     if (strpos($url, '\\') !== false) {
         throw new InvalidArgumentException('Backslashes are not allowed in the URL.');
     }
-    return $url;
-}
-
-function normalizeSvtplayUrlSTRICTUnused(string $input): string
-{
-    $url = trim($input);
-    if ($url === '' || preg_match('/[\x00-\x20\x7f]/', $url) === 1 || preg_match('/%(?:0[0-9a-f]|1[0-9a-f]|7f)/i', $url) === 1) {
-        throw new InvalidArgumentException('Enter a valid SVT Play video URL.');
-    }
-    if (strpos($url, '\\') !== false) {
-        throw new InvalidArgumentException('Backslashes are not allowed in the URL.');
-    }
+    // Only HTTPS URLs from the supported hosts, with no userinfo or port. This
+    // removes a class of URL-parsing tricks without enforcing any path shape.
     $parts = parse_url($url);
     if (!is_array($parts)
         || strtolower((string) ($parts['scheme'] ?? '')) !== 'https'
@@ -137,15 +146,7 @@ function normalizeSvtplayUrlSTRICTUnused(string $input): string
         || isset($parts['port'])) {
         throw new InvalidArgumentException('Only HTTPS URLs from svtplay.se and tv4play.se are accepted.');
     }
-    $path = (string) ($parts['path'] ?? '');
-    if (preg_match('~^/video/([A-Za-z0-9]+)(?:/([A-Za-z0-9-]+))?/?$~D', $path, $matches) !== 1) {
-        throw new InvalidArgumentException('The URL must point to an SVT Play video page.');
-    }
-    $canonicalPath = '/video/' . $matches[1];
-    if (isset($matches[2]) && $matches[2] !== '') {
-        $canonicalPath .= '/' . $matches[2];
-    }
-    return 'https://www.svtplay.se' . $canonicalPath;
+    return $url;
 }
 
 function processIsExpected(int $pid, string $expectedName, array $requiredArguments = []): bool
@@ -754,9 +755,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         try {
             $rawUrl = $_POST['url'] ?? '';
             if (!is_string($rawUrl) || strlen($rawUrl) > 2048) {
-                throw new InvalidArgumentException('Enter a valid SVT Play video URL.');
+                throw new InvalidArgumentException('Enter a valid SVT Play or TV4 Play video URL.');
             }
-            $normalizedUrl = normalizeSvtplayUrl($rawUrl);
+            $normalizedUrl = sanitizeDownloadUrl($rawUrl);
             $jobId = bin2hex(random_bytes(16));
             $jobDirectory = JOBS_DIR . '/' . $jobId;
             if (!mkdir($jobDirectory, 0750, true)) {
@@ -967,9 +968,9 @@ $hasActiveJobs = count(array_filter(
 
     <section class="panel form-panel" aria-labelledby="download-heading">
         <form method="post" action="">
-            <label id="download-heading" for="url">SVT Play video URL</label>
+            <label id="download-heading" for="url">SVT Play or TV4 Play video URL</label>
             <div class="form-row">
-                <input id="url" name="url" type="url" inputmode="url" maxlength="2048" placeholder="https://www.svtplay.se/video/..." required>
+                <input id="url" name="url" type="url" inputmode="url" maxlength="2048" placeholder="https://www.svtplay.se/video/... or https://www.tv4play.se/program/..." required>
                 <button type="submit">Download video</button>
             </div>
             <input type="hidden" name="csrf_token" value="<?= escapeHtml($csrfToken) ?>">
