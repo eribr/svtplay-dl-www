@@ -116,7 +116,7 @@ function normalizeSvtplayUrl(string $input): string
     if (strpos($url, '\\') !== false) {
         throw new InvalidArgumentException('Backslashes are not allowed in the URL.');
     }
-    return $url
+    return $url;
 }
 
 function normalizeSvtplayUrlSTRICTUnused(string $input): string
