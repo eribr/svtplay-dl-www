@@ -8,6 +8,7 @@ const JOBS_DIR = DATA_DIR . '/jobs';
 const DOWNLOADS_DIR = '/var/lib/svtplay/downloads';
 const PHP_CLI_BIN = '/usr/bin/php';
 const SVTPLAY_BIN = '/opt/svtplay-dl-venv/bin/svtplay-dl';
+const SVTPLAY_DL_CONFIG = '/var/www/.svtplay-dl.yaml';
 const POLL_INTERVAL_SECONDS = 60;
 const PROCESS_CHECK_INTERVAL_SECONDS = 1;
 const STARTUP_CHECK_INTERVAL_SECONDS = 1;
@@ -492,6 +493,225 @@ function fetchSvtProductionYear(string $svtplayUrl, string $logFile): ?string
     return null;
 }
 
+/**
+ * Dispatch the production-year lookup to the right provider for the URL host.
+ * SVT Play is scraped from its HTML; TV4 Play is a client-side app, so its year
+ * comes from a GraphQL gateway instead (see fetchTv4ProductionYear).
+ */
+function fetchProductionYear(string $url, string $logFile): ?string
+{
+    $parts = parse_url($url);
+    $host = strtolower((string) ($parts['host'] ?? ''));
+    if (in_array($host, ['svtplay.se', 'www.svtplay.se'], true)) {
+        return fetchSvtProductionYear($url, $logFile);
+    }
+    if (in_array($host, ['tv4play.se', 'www.tv4play.se'], true)) {
+        return fetchTv4ProductionYear($url, $logFile);
+    }
+    appendJobLog($logFile, 'Skipping production-year lookup because the URL is not from a supported host.');
+    return null;
+}
+
+/**
+ * Read the TV4 refresh token from the svtplay-dl config file, the same one
+ * svtplay-dl uses to download TV4 content. The file is YAML but the YAML
+ * extension is not assumed; only the tv4play service's token line is needed:
+ *
+ *   service:
+ *     tv4play:
+ *       token: "ey..."
+ */
+function readTv4RefreshToken(): ?string
+{
+    if (!is_file(SVTPLAY_DL_CONFIG) || !is_readable(SVTPLAY_DL_CONFIG)) {
+        return null;
+    }
+    $contents = file_get_contents(SVTPLAY_DL_CONFIG);
+    if (!is_string($contents)) {
+        return null;
+    }
+    $lines = preg_split('/\r\n|\r|\n/', $contents);
+    $tv4Indent = null;
+    foreach ($lines as $line) {
+        if ($tv4Indent === null) {
+            if (preg_match('/^(\s*)tv4play:\s*$/S', $line, $m) === 1) {
+                $tv4Indent = strlen($m[1]);
+            }
+            continue;
+        }
+        // A non-blank line that leaves the tv4play block ends the search.
+        if (trim($line) !== '' && preg_match('/^(\s*)\S/', $line, $m) === 1 && strlen($m[1]) <= $tv4Indent) {
+            break;
+        }
+        if (preg_match('/^\s*token:\s*["\']?(ey[A-Za-z0-9._\-]+)["\']?\s*$/S', $line, $m) === 1) {
+            return $m[1];
+        }
+    }
+    return null;
+}
+
+/**
+ * Exchange a TV4 refresh token for a short-lived access token. TV4 returns the
+ * same refresh token back (verified not to rotate), so the svtplay-dl config is
+ * left untouched. Returns null on any failure so the caller can fall back to an
+ * anonymous request.
+ */
+function exchangeTv4AccessToken(string $refreshToken, string $logFile): ?string
+{
+    $body = json_encode(
+        ['refresh_token' => $refreshToken, 'grant_type' => 'refresh_token', 'is_child' => false],
+        JSON_THROW_ON_ERROR
+    );
+    $context = stream_context_create([
+        'http' => [
+            'method' => 'POST',
+            'timeout' => 8,
+            'ignore_errors' => true,
+            'header' => "Content-Type: application/json\r\nAccept: application/json\r\nClient-Name: tv4-web\r\n",
+            'content' => $body,
+        ],
+    ]);
+    $response = @file_get_contents('https://auth.tv4.a2d.tv/v2/auth/token', false, $context);
+    if (!is_string($response) || $response === '') {
+        appendJobLog($logFile, 'TV4 token exchange returned no body; the production-year lookup will continue anonymously.');
+        return null;
+    }
+    $decoded = json_decode($response, true);
+    if (!is_array($decoded) || !is_string($decoded['access_token'] ?? null) || $decoded['access_token'] === '') {
+        appendJobLog($logFile, 'TV4 token exchange did not return an access token; the production-year lookup will continue anonymously.');
+        return null;
+    }
+    return $decoded['access_token'];
+}
+
+/**
+ * Look up the production year for a TV4 Play title from TV4's public GraphQL
+ * client gateway. tv4play.se is a single-page app, so the year is not in the
+ * HTML. The request is authenticated with the TV4 refresh token from the
+ * svtplay-dl config when available (premium titles can be invisible
+ * anonymously) and falls back to anonymous otherwise.
+ *
+ * The media id is a path segment of /program/..., but its position differs
+ * between a stand-alone title (/program/{id}/{slug}) and an episode
+ * (/program/{series-slug}/{episode-slug}/{id}). Each segment is therefore tried
+ * (last first, which suits episode URLs) until one resolves to a title.
+ */
+function fetchTv4ProductionYear(string $tv4Url, string $logFile): ?string
+{
+    $urlParts = parse_url($tv4Url);
+    if (!is_array($urlParts)
+        || strtolower((string) ($urlParts['scheme'] ?? '')) !== 'https'
+        || !in_array(strtolower((string) ($urlParts['host'] ?? '')), ['tv4play.se', 'www.tv4play.se'], true)) {
+        appendJobLog($logFile, 'Skipping TV4 production-year lookup because the URL is not an allowed TV4 Play URL.');
+        return null;
+    }
+
+    $segments = [];
+    foreach (explode('/', (string) ($urlParts['path'] ?? '')) as $segment) {
+        $segment = trim($segment);
+        if ($segment !== '' && strtolower($segment) !== 'program') {
+            $segments[] = $segment;
+        }
+    }
+    $candidates = array_reverse(array_values($segments));
+    if ($candidates === []) {
+        appendJobLog($logFile, 'Skipping TV4 production-year lookup: no media id could be read from the URL path.');
+        return null;
+    }
+
+    $endpoint = 'https://client-gateway.tv4.a2d.tv/graphql?operationName=ProductionYear';
+    // productionYear exists on both Movie and Series; an Episode carries it on
+    // its parent series.
+    $query = 'query ProductionYear($mediaId: ID!) { media(id: $mediaId) { __typename '
+        . '... on Series { title productionYear } '
+        . '... on Movie { title productionYear } '
+        . '... on Episode { title series { title productionYear } } } }';
+
+    // Authenticate when a TV4 refresh token is configured (the same file
+    // svtplay-dl downloads with). Premium titles can be invisible anonymously.
+    $accessToken = null;
+    $refreshToken = readTv4RefreshToken();
+    if ($refreshToken !== null) {
+        $accessToken = exchangeTv4AccessToken($refreshToken, $logFile);
+    }
+    $httpHeaders = "Content-Type: application/json\r\n"
+        . "Accept: application/json\r\n"
+        . "Client-Name: tv4-web\r\n"
+        . "Client-Version: 5.2.0\r\n";
+    if ($accessToken !== null) {
+        $httpHeaders .= "Authorization: Bearer " . $accessToken . "\r\n";
+    }
+
+    foreach ($candidates as $index => $mediaId) {
+        if ($index >= 5) {
+            break;
+        }
+        $requestBody = json_encode(
+            [
+                'operationName' => 'ProductionYear',
+                'query' => $query,
+                'variables' => ['mediaId' => $mediaId],
+            ],
+            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
+        );
+        $context = stream_context_create([
+            'http' => [
+                'method' => 'POST',
+                'timeout' => 8,
+                'ignore_errors' => true,
+                'header' => $httpHeaders,
+                'content' => $requestBody,
+            ],
+        ]);
+        $response = @file_get_contents($endpoint, false, $context);
+        $responseHeaders = isset($http_response_header) && is_array($http_response_header)
+            ? $http_response_header
+            : [];
+        $responseStatus = $responseHeaders[0] ?? '(no HTTP status)';
+
+        if (!is_string($response) || $response === '') {
+            appendJobLog($logFile, 'TV4 production-year lookup returned no body for media id "' . $mediaId . '". HTTP: ' . $responseStatus . '. Continuing without a year.');
+            return null;
+        }
+
+        $decoded = json_decode($response, true);
+        if (!is_array($decoded)) {
+            appendJobLog($logFile, 'TV4 production-year lookup for media id "' . $mediaId . '" returned invalid JSON. HTTP: ' . $responseStatus . '. Continuing without a year.');
+            return null;
+        }
+        if (!empty($decoded['errors'])) {
+            $errorDetail = isset($decoded['errors'][0]['message']) ? (string) $decoded['errors'][0]['message'] : '(no error message)';
+            appendJobLog($logFile, 'TV4 production-year lookup for media id "' . $mediaId . '" returned a GraphQL error: ' . $errorDetail . '. Continuing without a year.');
+            return null;
+        }
+
+        $media = $decoded['data']['media'] ?? null;
+        if (!is_array($media)) {
+            // This segment was not a resolvable media id (e.g. a slug); try the next.
+            continue;
+        }
+
+        $typename = (string) ($media['__typename'] ?? '');
+        $year = $media['productionYear'] ?? $media['series']['productionYear'] ?? null;
+        $title = (string) ($media['title'] ?? ($media['series']['title'] ?? ''));
+
+        if ($year === null) {
+            appendJobLog($logFile, 'TV4 resolved media id "' . $mediaId . '" (' . $typename . ', "' . $title . '") but it has no production year. Continuing without a year.');
+            return null;
+        }
+        $yearInt = (int) $year;
+        if ($yearInt < 1888 || $yearInt > (int) gmdate('Y') + 1) {
+            appendJobLog($logFile, 'TV4 production year "' . $year . '" for "' . $title . '" is out of range. Continuing without a year.');
+            return null;
+        }
+        appendJobLog($logFile, 'Found production year ' . $yearInt . ' for TV4 title "' . $title . '" (' . $typename . ').');
+        return (string) $yearInt;
+    }
+
+    appendJobLog($logFile, 'No segment in the TV4 URL path resolved to a title. Continuing without a year.');
+    return null;
+}
+
 function finalVideoPath(string $videoPath, string $jobId, ?string $year): string
 {
     $sourceName = pathinfo($videoPath, PATHINFO_FILENAME);
@@ -586,7 +806,7 @@ function runJob(string $jobId): void
         $storedJob['status'] = 'finalizing';
         $storedJob['phase'] = 'finalizing';
     });
-    $productionYear = fetchSvtProductionYear((string) $job['url'], $logFile);
+    $productionYear = fetchProductionYear((string) $job['url'], $logFile);
     $finalPath = finalVideoPath($videoPath, $jobId, $productionYear);
     updateJob($jobId, static function (array &$storedJob) use ($finalPath): void {
         $storedJob['output'] = $finalPath;
